@@ -2,7 +2,7 @@
 import pandas as pd
 import streamlit as st
 
-from gc_core import SAMPLE, compute, fetch_all, fetch_market, parse_tickers, render_conditions, signal
+from gc_core import SAMPLE, compute, fetch_all, fetch_market, fetch_pbr, parse_tickers, render_conditions, signal
 
 st.set_page_config(page_title="ゴールデンクロス検出", page_icon="📈", layout="centered")
 
@@ -14,6 +14,14 @@ with st.expander("① 銘柄を入力", expanded=False):
     text = st.text_area("1行1銘柄（「7203」または「7203,トヨタ」）", value=SAMPLE, height=200)
 
 p = render_conditions(show_days=True)
+
+with st.expander("④ 割安さ（スクリーニングのみ）【新】", expanded=False):
+    pbr_on = st.checkbox("PBRが◯倍以下〔推奨: 目安1.0〜1.5倍〕", value=False,
+                         help="日本株では割安株が報われる傾向（バリュー効果）が確認されており、トレンド系の手法と組み合わせると"
+                              "効果的という研究があります（Fama & French 2012、Asness 2011）。"
+                              "現在のPBRしか取れないため、過去検証・自動探索では使えません。")
+    pbr_max = float(st.number_input("└ PBR上限（倍）", 0.1, 20.0, 1.5, 0.1, disabled=not pbr_on))
+    st.caption("条件を満たした銘柄だけPBRを取得します。PBRが取れない銘柄は「PBR不明」として残します。")
 
 if st.button("▶ スクリーニング開始", type="primary", width="stretch"):
     items = parse_tickers(text)
@@ -56,9 +64,23 @@ if st.button("▶ スクリーニング開始", type="primary", width="stretch")
             "RSI": round(float(last["rsi_v"]), 1), "乖離率%": round(float(last["dev_v"]), 1),
             "出来高倍率": round(float(x.loc[d, "vol_x"]), 2) if pd.notna(x.loc[d, "vol_x"]) else None,
             "ATR%": round(float(last["atr_v"]), 1),
+            "52週高値比%": round(float(last["near52_v"]), 1) if pd.notna(last["near52_v"]) else None,
+            "クロス日の上昇率%": round(float(x.loc[d, "jump_v"]), 1) if pd.notna(x.loc[d, "jump_v"]) else None,
             "売買代金(百万円)": round(float(last["value_m"]), 1),
             "チャート": f"https://finance.yahoo.co.jp/quote/{code}.T/chart",
         })
+
+    if pbr_on and rows:
+        with st.spinner("PBRを取得中..."):
+            for r in rows:
+                r["PBR"] = fetch_pbr(r["コード"])
+        before = len(rows)
+        rows = [r for r in rows if r["PBR"] is None or r["PBR"] <= pbr_max]
+        unknown = sum(r["PBR"] is None for r in rows)
+        st.caption(f"PBR {pbr_max:g}倍以下で絞り込み：{before}銘柄 → {len(rows)}銘柄"
+                   + (f"（うちPBR不明 {unknown}銘柄）" if unknown else ""))
+        for r in rows:
+            r["PBR"] = f"{r['PBR']:.2f}" if r["PBR"] is not None else "不明"
 
     miss = len(codes) - len(data)
     note = f"（取得できなかった銘柄: {miss}）" if miss else ""
@@ -66,6 +88,7 @@ if st.button("▶ スクリーニング開始", type="primary", width="stretch")
         st.info(f"該当なし。対象 {len(codes)} 銘柄 {note}\n\n条件を減らすか、「直近N営業日以内」を増やすと見つかる場合があります。")
     else:
         res = pd.DataFrame(rows).sort_values("クロス日", ascending=False)
+        res = res[[c for c in res.columns if c != "チャート"] + ["チャート"]]  # チャートのリンクを右端に
         st.success(f"該当 {len(res)} 銘柄 / 対象 {len(codes)} 銘柄 {note}")
         st.dataframe(res, hide_index=True, width="stretch",
                      column_config={"チャート": st.column_config.LinkColumn("チャート", display_text="開く")})
