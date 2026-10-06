@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from gc_core import (COND_LABEL, CONDS, SAMPLE, compute, fetch_all, fetch_market, masks, parse_tickers,
+from gc_core import (COND_LABEL, CONDS, SAMPLE, TRIGGERS, compute, fetch_all, fetch_market, masks, parse_tickers,
                      render_conditions, signal)
 
 st.set_page_config(page_title="過去検証", page_icon="🔬", layout="centered")
@@ -19,7 +19,7 @@ def stat(r):
 
 
 st.title("🔬 過去検証")
-st.caption("買い＝シグナル翌営業日の始値。売り＝購入日から数えて指定した営業日後の終値（損切り・利確なし）。"
+st.caption("買い＝シグナル（きっかけ）の翌営業日の始値。売り＝購入日から数えて指定した営業日後の終値（損切り・利確なし）。"
            "条件はその日までのデータだけで判定しています。")
 
 with st.expander("① 銘柄", expanded=False):
@@ -62,10 +62,12 @@ if st.button("▶ 検証を実行", type="primary", width="stretch"):
     for code, df in data.items():
         if len(df) < 260:
             continue
-        x = compute(df, p["short"], p["long"], mkt)
+        x = compute(df, p["short"], p["long"], mkt, p["pb_pct"], p["rv_rsi"])
         m = masks(x, p)
         t = pd.DataFrame(m)
-        t["cross"] = x["cross"]
+        t["cross"] = x["trig_" + p["trigger"]]  # 選んだきっかけ（以下「基準のきっかけ」）
+        for k in TRIGGERS:
+            t["trig_" + k] = x["trig_" + k]
         t["sig"] = signal(x, p, m)
         entry = df["Open"].shift(-1)  # 購入日（シグナルの翌営業日）の始値
         for h in horizons:
@@ -89,6 +91,32 @@ st.divider()
 st.write(f"対象 {bt['n_codes']} 銘柄 / 期間 {T.index.min():%Y-%m-%d} 〜 {T.index.max():%Y-%m-%d} / "
          f"今の設定のシグナル **{len(S)} 件**（{S.index.nunique()} 日）")
 
+# ---- 0. きっかけ別の比較
+st.subheader("0. 買いのきっかけ別の比較")
+st.caption(f"同じ保有日数（購入後{bt['n_hold']}日）・同じ勝ちの基準で、4つのきっかけを比べています。"
+           "「絞り込みなし」はきっかけだけ、「絞り込みあり」は③でONにした条件をすべて足した場合です。")
+cond_all = np.ones(len(T), dtype=bool)
+for c in CONDS:
+    if pp.get(c["key"] + "_on") and c["key"] in T:
+        cond_all &= T[c["key"]].to_numpy(bool)
+rc0 = f"r{bt['n_hold']}"
+_, bw0, bmu0 = stat(T[rc0])
+trig_rows = []
+for k, v in TRIGGERS.items():
+    g0 = T[T["trig_" + k].to_numpy(bool)]
+    g1 = T[T["trig_" + k].to_numpy(bool) & cond_all]
+    n0, w0, m0 = stat(g0[rc0])
+    n1, w1, m1 = stat(g1[rc0])
+    _, wa, _ = stat(g0[g0.index <= mid][rc0])
+    _, wb, _ = stat(g0[g0.index > mid][rc0])
+    trig_rows.append({"きっかけ": v["label"] + ("◀選択中" if k == pp["trigger"] else ""),
+                      "件数": n0, "勝率%": round(w0, 1), "平均%": round(m0, 2),
+                      "前半勝率%": round(wa, 1), "後半勝率%": round(wb, 1),
+                      "絞り込みあり 件数": n1, "絞り込みあり 勝率%": round(w1, 1), "絞り込みあり 平均%": round(m1, 2)})
+st.dataframe(pd.DataFrame(trig_rows), hide_index=True, width="stretch")
+st.caption(f"参考：毎日買った場合 勝率 {bw0:.1f}%・平均 {bmu0:.2f}%。"
+           "勝率だけでなく平均%も見てください（勝率が低くても、勝つときの利幅が大きいきっかけもあります）。")
+
 # ---- 1. 今の設定の成績
 st.subheader("1. 今の設定の成績")
 HZ, NH = bt["horizons"], bt["n_hold"]
@@ -102,11 +130,11 @@ for h in HZ:
     se = S[f"r{h}"].dropna().std() / np.sqrt(n) * 100 if n > 1 else float("nan")
     rows.append({"保有（購入後）": f"{h}日" + ("◀設定" if h == NH else ""), "件数": n, "勝率%": round(w, 1),
                  "平均%": round(mu, 2), "±(95%)": round(1.96 * se, 2),
-                 "クロスのみ勝率%": round(cw, 1), "クロスのみ平均%": round(cmu, 2),
+                 "きっかけのみ勝率%": round(cw, 1), "きっかけのみ平均%": round(cmu, 2),
                  "毎日買った勝率%": round(bw, 1), "毎日買った平均%": round(bmu, 2)})
 st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 st.caption("勝率は、リターン（売買コスト引き後）が勝ちの基準以上だった割合。"
-           "「平均%」が「クロスのみ」や「毎日買った」を上回り、その差が「±(95%)」より大きければ、偶然ではない可能性が高まります。"
+           "「平均%」が「きっかけのみ」や「毎日買った」を上回り、その差が「±(95%)」より大きければ、偶然ではない可能性が高まります。"
            "（◀設定＝上で指定した保有日数。5・10・20・40日は比較用です）")
 
 h = st.selectbox("以下の表の保有日数", HZ, index=HZ.index(NH), format_func=lambda v: f"購入後{v}日")
@@ -114,7 +142,7 @@ rc = f"r{h}"
 
 # ---- 2. 条件ごとの効果（推奨の追加項目を探す）
 st.subheader("2. 条件ごとの効果と再現性")
-st.caption("「クロスのみ」に条件を1つだけ足したら成績がどう変わるか。期間を前半・後半に分け、両方で改善した条件を「有望」としています。")
+st.caption("「きっかけのみ」に条件を1つだけ足したら成績がどう変わるか。期間を前半・後半に分け、両方で改善した条件を「有望」としています。")
 
 base = T[T["cross"]]
 _, _, b_all = stat(base[rc])
@@ -147,7 +175,7 @@ def cmp_row(label, g):
             "誤差±": round(err, 2), "前半改善": round(d1, 2), "後半改善": round(d2, 2), "判定": judge(n, d, d1, d2, err)}
 
 
-cmp_rows = [{"条件": "クロスのみ（基準）", "件数": len(base[rc].dropna()), "勝率%": round(stat(base[rc])[1], 1),
+cmp_rows = [{"条件": "きっかけのみ（基準）", "件数": len(base[rc].dropna()), "勝率%": round(stat(base[rc])[1], 1),
              "平均%": round(b_all, 2), "改善": 0.0, "誤差±": round(noise(base[rc]), 2),
              "前半改善": 0.0, "後半改善": 0.0, "判定": "—"}]
 for c in CONDS:
@@ -163,7 +191,7 @@ cmp = pd.DataFrame(cmp_rows)
 st.dataframe(cmp, hide_index=True, width="stretch")
 good = [r["条件"] for r in cmp_rows[1:-1] if r["判定"] == "◎ 有望"]
 st.write("**有望な条件:** " + ("、".join(good) if good else "なし（この期間・銘柄では、はっきり効く条件は見つかりませんでした）"))
-st.caption("改善＝その条件を足したときの平均リターン − クロスのみの平均（%ポイント）。"
+st.caption("改善＝その条件を足したときの平均リターン − きっかけのみの平均（%ポイント）。"
            "「◎ 有望」は、前半・後半ともに改善し、かつ改善が「誤差±」より大きいもの。"
            "値を使う条件は、上で設定した値で判定しています。")
 
