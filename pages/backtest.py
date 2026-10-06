@@ -7,26 +7,38 @@ from gc_core import (COND_LABEL, CONDS, SAMPLE, compute, fetch_all, fetch_market
                      render_conditions, signal)
 
 st.set_page_config(page_title="過去検証", page_icon="🔬", layout="centered")
-HORIZONS = [5, 10, 20]
+WIN_THR = 0.0  # 勝ちの基準（リターン、小数。下の入力欄で上書き）
 
 
 def stat(r):
+    """(件数, 勝率%, 平均%)。勝ち＝リターン（コスト引き後）が基準以上。"""
     r = r.dropna()
     if len(r) == 0:
         return 0, float("nan"), float("nan")
-    return len(r), (r > 0).mean() * 100, r.mean() * 100
+    return len(r), (r >= WIN_THR).mean() * 100, r.mean() * 100
 
 
 st.title("🔬 過去検証")
-st.caption("買い＝シグナル翌営業日の始値、売り＝5/10/20営業日後の終値。条件はその日までのデータだけで判定しています。")
+st.caption("買い＝シグナル翌営業日の始値。売り＝購入日から数えて指定した営業日後の終値（損切り・利確なし）。"
+           "条件はその日までのデータだけで判定しています。")
 
 with st.expander("① 銘柄", expanded=False):
     text = st.text_area("1行1銘柄", value=SAMPLE, height=180)
 
 p = render_conditions(show_days=False)
-c1, c2 = st.columns(2)
-n_days = int(c1.number_input("検証期間（営業日）", 250, 1500, 1000, 50, help="推奨: 1000日（約4年）。"))
-cost = c2.number_input("売買コスト（往復%）", 0.0, 3.0, 0.2, 0.1, help="推奨: 0.2%前後（手数料＋値段のズレ）。") / 100
+with st.expander("④ 勝ちの条件・期間", expanded=True):
+    c1, c2 = st.columns(2)
+    n_hold = int(c1.number_input("保有日数（購入後◯営業日）", 1, 250, 15, 1,
+                                 help="購入日から数えて何営業日後に売るか。推奨: 15日（約3週間）。20営業日≒1か月。"))
+    win_pct = c2.number_input("勝ちの基準（リターン◯%以上）", -20.0, 50.0, 0.0, 0.5,
+                              help="売買コストを引いたあとのリターンがこの値以上なら「勝ち」。推奨: 0%（プラスなら勝ち）。"
+                                   "「+3%以上で勝ち」にしたいときは3を入れます。")
+    c3, c4 = st.columns(2)
+    n_days = int(c3.number_input("検証期間（営業日）", 250, 1500, 1000, 50, help="推奨: 1000日（約4年）。"))
+    cost = c4.number_input("売買コスト（往復%）", 0.0, 3.0, 0.2, 0.1,
+                           help="推奨: 0.2%前後（手数料＋値段のズレ）。") / 100
+    st.caption(f"今の設定：購入後 **{n_hold}営業日** 時点で、リターンが **{win_pct:g}%以上** なら勝ち")
+WIN_THR = win_pct / 100
 
 if st.button("▶ 検証を実行", type="primary", width="stretch"):
     items = parse_tickers(text)
@@ -34,7 +46,8 @@ if st.button("▶ 検証を実行", type="primary", width="stretch"):
         st.warning("銘柄を入力し、短期線は長期線より小さくしてください。")
         st.stop()
     codes = [c for c, _ in items]
-    period = f"{min(int(np.ceil(n_days / 245)) + 2, 10)}y"  # 200日線の準備期間を足す
+    horizons = sorted({5, 10, 20, 40, n_hold})  # 保有日数ごとの比較用に、いくつか一緒に計算
+    period = f"{min(int(np.ceil((n_days + n_hold) / 245)) + 2, 10)}y"  # 200日線の準備期間を足す
     try:
         data = fetch_all(codes, period)
     except Exception as e:
@@ -54,15 +67,16 @@ if st.button("▶ 検証を実行", type="primary", width="stretch"):
         t = pd.DataFrame(m)
         t["cross"] = x["cross"]
         t["sig"] = signal(x, p, m)
-        entry = df["Open"].shift(-1)
-        for h in HORIZONS:
-            t[f"r{h}"] = df["Close"].shift(-h) / entry - 1 - cost
+        entry = df["Open"].shift(-1)  # 購入日（シグナルの翌営業日）の始値
+        for h in horizons:
+            t[f"r{h}"] = df["Close"].shift(-(h + 1)) / entry - 1 - cost  # 購入日からh営業日後の終値で売る
         t["code"] = code
         frames.append(t.iloc[-n_days:])
     if not frames:
         st.error("検証できる株価データがありませんでした。")
         st.stop()
-    st.session_state["bt"] = dict(T=pd.concat(frames), p=dict(p), mkt_ok=mkt is not None, n_codes=len(frames))
+    st.session_state["bt"] = dict(T=pd.concat(frames), p=dict(p), mkt_ok=mkt is not None, n_codes=len(frames),
+                                  horizons=horizons, n_hold=n_hold)
 
 if "bt" not in st.session_state:
     st.stop()
@@ -77,18 +91,25 @@ st.write(f"対象 {bt['n_codes']} 銘柄 / 期間 {T.index.min():%Y-%m-%d} 〜 {
 
 # ---- 1. 今の設定の成績
 st.subheader("1. 今の設定の成績")
+HZ, NH = bt["horizons"], bt["n_hold"]
+if WIN_THR != 0:
+    st.caption(f"勝ちの基準: リターン {WIN_THR * 100:g}% 以上（コスト引き後）")
 rows = []
-for h in HORIZONS:
+for h in HZ:
     n, w, mu = stat(S[f"r{h}"])
     _, bw, bmu = stat(T[f"r{h}"])
     _, cw, cmu = stat(T[T["cross"]][f"r{h}"])
     se = S[f"r{h}"].dropna().std() / np.sqrt(n) * 100 if n > 1 else float("nan")
-    rows.append({"保有": f"{h}日", "件数": n, "勝率%": round(w, 1), "平均%": round(mu, 2), "±(95%)": round(1.96 * se, 2),
-                 "クロスのみ平均%": round(cmu, 2), "毎日買った平均%": round(bmu, 2)})
+    rows.append({"保有（購入後）": f"{h}日" + ("◀設定" if h == NH else ""), "件数": n, "勝率%": round(w, 1),
+                 "平均%": round(mu, 2), "±(95%)": round(1.96 * se, 2),
+                 "クロスのみ勝率%": round(cw, 1), "クロスのみ平均%": round(cmu, 2),
+                 "毎日買った勝率%": round(bw, 1), "毎日買った平均%": round(bmu, 2)})
 st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-st.caption("「平均%」が「クロスのみ」や「毎日買った」を上回り、その差が「±(95%)」より大きければ、偶然ではない可能性が高まります。")
+st.caption("勝率は、リターン（売買コスト引き後）が勝ちの基準以上だった割合。"
+           "「平均%」が「クロスのみ」や「毎日買った」を上回り、その差が「±(95%)」より大きければ、偶然ではない可能性が高まります。"
+           "（◀設定＝上で指定した保有日数。5・10・20・40日は比較用です）")
 
-h = st.selectbox("以下の表の保有日数", HORIZONS, index=2, format_func=lambda v: f"{v}日")
+h = st.selectbox("以下の表の保有日数", HZ, index=HZ.index(NH), format_func=lambda v: f"購入後{v}日")
 rc = f"r{h}"
 
 # ---- 2. 条件ごとの効果（推奨の追加項目を探す）
