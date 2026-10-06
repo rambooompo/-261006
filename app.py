@@ -2,7 +2,7 @@
 import pandas as pd
 import streamlit as st
 
-from gc_core import SAMPLE, compute, fetch_all, fetch_market, fetch_pbr, parse_tickers, render_conditions, signal
+from gc_core import render_universe, resolve_items, SAMPLE, compute, fetch_all, fetch_market, fetch_pbr, parse_tickers, render_conditions, signal
 
 st.set_page_config(page_title="ゴールデンクロス検出", page_icon="📈", layout="centered")
 
@@ -10,8 +10,7 @@ st.title("📈 買いシグナル検出")
 st.caption("選んだ「買いのきっかけ」が出て、条件をすべて満たした銘柄を探します。株価はYahoo Finance（遅延・欠損あり）。"
            "きっかけ同士の比較や条件の効果は、左上メニューの「backtest」で過去検証できます。")
 
-with st.expander("① 銘柄を入力", expanded=False):
-    text = st.text_area("1行1銘柄（「7203」または「7203,トヨタ」）", value=SAMPLE, height=200)
+kind, text = render_universe()
 
 p = render_conditions(show_days=True)
 
@@ -24,7 +23,7 @@ with st.expander("④ 割安さ（スクリーニングのみ）【新】", expa
     st.caption("条件を満たした銘柄だけPBRを取得します。PBRが取れない銘柄は「PBR不明」として残します。")
 
 if st.button("▶ スクリーニング開始", type="primary", width="stretch"):
-    items = parse_tickers(text)
+    items = resolve_items(kind, text)
     if not items:
         st.warning("銘柄コードを入力してください。")
         st.stop()
