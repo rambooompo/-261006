@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from gc_core import SAMPLE, TRIGGERS, compute, fetch_all, fetch_market, parse_tickers
+from gc_core import render_universe, resolve_items, SAMPLE, TRIGGERS, compute, fetch_all, fetch_market, parse_tickers
 
 st.set_page_config(page_title="自動探索", page_icon="🧭", layout="centered")
 
@@ -167,8 +167,7 @@ st.title("🧭 自動探索")
 st.caption("条件の組み合わせを自動でたくさん試し、勝率の高い条件を探します。"
            "偶然よく見える組み合わせを選んでしまわないよう、「前半で選び、後半で確かめる」方法を使います。")
 
-with st.expander("① 銘柄", expanded=False):
-    text = st.text_area("1行1銘柄", value=SAMPLE, height=180)
+kind, text = render_universe()
 
 with st.expander("② 売買の条件", expanded=True):
     trig = st.radio("買いのきっかけ", list(TRIGGERS), format_func=lambda k: TRIGGERS[k]["label"],
@@ -197,7 +196,7 @@ with st.expander("③ 探索の設定", expanded=False):
     min_te = int(c10.number_input("後半の最小件数", 5, 500, 20, 5, help="推奨: 20件以上。"))
 
 if st.button("▶ 自動探索を実行", type="primary", width="stretch"):
-    items = parse_tickers(text)
+    items = resolve_items(kind, text)
     if not items or short >= long_:
         st.warning("銘柄を入力し、短期線は長期線より小さくしてください。")
         st.stop()
