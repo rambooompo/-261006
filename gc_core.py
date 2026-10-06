@@ -135,10 +135,19 @@ CONDS = [
          help="長期（約1年）の上昇トレンド中の銘柄だけに絞ります。75日線と重なる部分が多いので、件数とのバランスで判断。"),
     dict(key="perfect", group="トレンド", label="パーフェクトオーダー（短期＞長期＞75日）", on=False, rec="推奨: OFF",
          help="移動平均線が上から順に並ぶ強いトレンド。クロス直後は成立しにくく、件数が大きく減るためOFF推奨。"),
+    dict(key="near52", group="トレンド", label="株価が52週高値の◯%以上【新】", on=False, rec="推奨: 検証で判断（目安90%）",
+         val=dict(label="52週高値に対する割合（%）", default=90.0, min=50.0, max=100.0, step=1.0),
+         help="終値が過去約1年の最高値にどれだけ近いか。52週高値に近い株ほど、その後のリターンが高い傾向があるという研究"
+              "（George & Hwang 2004、米国株）に基づく条件。日本株での効果は自動探索で確認してください。"),
     # --- 出来高・流動性
     dict(key="vol", group="出来高・流動性", label="クロス日の出来高が平均の◯倍以上", on=True, rec="推奨: 1.5〜2.0倍",
          val=dict(label="出来高倍率（倍）", default=1.5, min=0.5, max=10.0, step=0.5),
          help="クロス日の出来高が直近20日平均より多いこと。買いが本当に入っているかの確認です。"),
+    dict(key="volmax", group="出来高・流動性", label="クロス日の出来高が平均の◯倍以下【新】", on=False,
+         rec="推奨: 検証で判断（目安3倍）",
+         val=dict(label="出来高倍率の上限（倍）", default=3.0, min=1.0, max=20.0, step=0.5),
+         help="出来高が極端に多い日を除きます。売買が多い銘柄ほど、その後のリターンが低く、上昇の反転も早いという研究"
+              "（Lee & Swaminathan 2000）に基づく条件。「◯倍以上」と組み合わせると、出来高の範囲を指定できます。"),
     dict(key="value", group="出来高・流動性", label="平均売買代金が◯百万円以上", on=True, rec="推奨: 100百万円以上",
          val=dict(label="売買代金（百万円）", default=100.0, min=1.0, max=100000.0, step=10.0),
          help="1日あたりの売買代金（20日平均）。少ない銘柄は値が飛びやすく、思った値段で売買できないことがあります。"),
@@ -149,6 +158,10 @@ CONDS = [
     dict(key="dev", group="過熱感", label="長期線との乖離が◯％以下", on=True, rec="推奨: 5〜10%",
          val=dict(label="乖離率上限（%）", default=10.0, min=1.0, max=50.0, step=1.0),
          help="株価が長期線からどれだけ離れているか。大きいほど、すでに上がりきった後のクロスです。"),
+    dict(key="jump", group="過熱感", label="クロス日の上昇率が◯%以下【新】", on=False, rec="推奨: 検証で判断（目安5%）",
+         val=dict(label="前日比の上限（%）", default=5.0, min=0.0, max=30.0, step=0.5),
+         help="急騰した日のクロスを除きます。日本株では1日に大きく上がった株が直後の数日で下がりやすいという研究"
+              "（Pham 2007）があります。ただし影響は短期で、主な効果は「高値で買わない」ことです。"),
     dict(key="atr", group="過熱感", label="値動きの荒さ（ATR）が◯％以下【新】", on=False, rec="推奨: 検証で判断（目安5%）",
          val=dict(label="ATR上限（株価比 %）", default=5.0, min=1.0, max=20.0, step=0.5),
          help="1日の平均的な値幅（14日）が株価の何％か。大きい銘柄はだましで大きく損をしやすいです。"),
@@ -229,6 +242,8 @@ def compute(df, short, long_, mkt_ok=None):
     x["rsi_v"] = rsi_wilder(c)
     x["dev_v"] = (c - l) / l * 100
     x["atr_v"] = tr.rolling(14).mean() / c * 100
+    x["near52_v"] = c / h.rolling(245, min_periods=200).max() * 100  # 52週（約245営業日）高値に対する割合
+    x["jump_v"] = (c / c.shift(1) - 1) * 100  # 前日比（%）
     x["rising"] = l > l.shift(1)
     x["above75"] = c > m75
     x["above200"] = c > m200
@@ -249,6 +264,8 @@ def masks(x, p):
         "rising": x["rising"], "above75": x["above75"], "above200": x["above200"], "perfect": x["perfect"],
         "vol": x["vol_x"] >= p["vol_val"], "value": x["value_m"] >= p["value_val"],
         "rsi": x["rsi_v"] <= p["rsi_val"], "dev": x["dev_v"] <= p["dev_val"], "atr": x["atr_v"] <= p["atr_val"],
+        "near52": x["near52_v"] >= p["near52_val"], "volmax": x["vol_x"] <= p["volmax_val"],
+        "jump": x["jump_v"] <= p["jump_val"],
         "market": x["market"], "bullish": x["bullish"], "breakout": x["breakout"], "macd": x["macd"],
     }
     return {k: v.fillna(False).astype(bool) for k, v in m.items()}
@@ -306,6 +323,18 @@ def fetch_all(codes, period):
     finally:
         bar.empty()
     return data
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_pbr(code: str):
+    """現在のPBR（取れなければ None）。過去の値は取れないので、スクリーニングでのみ使う。"""
+    import yfinance as yf
+
+    try:
+        v = yf.Ticker(code + ".T").info.get("priceToBook")
+        return float(v) if v is not None and v > 0 else None
+    except Exception:
+        return None
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
