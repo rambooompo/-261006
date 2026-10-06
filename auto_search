@@ -5,13 +5,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from gc_core import SAMPLE, compute, fetch_all, fetch_market, parse_tickers
+from gc_core import SAMPLE, TRIGGERS, compute, fetch_all, fetch_market, parse_tickers
 
 st.set_page_config(page_title="自動探索", page_icon="🧭", layout="centered")
 
 BINARY = [
     ("rising", "長期線が上向き"), ("above75", "株価が75日線より上"), ("above200", "株価が200日線より上"),
-    ("perfect", "パーフェクトオーダー"), ("market", "日経平均が75日線より上"), ("bullish", "クロス日が陽線"),
+    ("perfect", "パーフェクトオーダー"), ("market", "日経平均が75日線より上"), ("bullish", "シグナル日が陽線"),
     ("breakout", "直近20日の高値更新"), ("macd", "MACDがシグナルより上"),
 ]
 VALUED = [  # (ID, 列名, 表示, 比較, 試す値)  ※同じ列でも向きが違えば別の条件として扱う
@@ -22,25 +22,25 @@ VALUED = [  # (ID, 列名, 表示, 比較, 試す値)  ※同じ列でも向き�
     ("dev", "dev_v", "長期線との乖離{}%以下", "<=", [5, 10, 15]),
     ("atr", "atr_v", "ATR(値動き)が株価の{}%以下", "<=", [3, 5, 7]),
     ("near52", "near52_v", "52週高値の{}%以上", ">=", [80, 90, 95]),
-    ("jump", "jump_v", "クロス日の上昇率{}%以下", "<=", [3, 5, 8]),
+    ("jump", "jump_v", "シグナル日の上昇率{}%以下", "<=", [3, 5, 8]),
 ]
 TOP = 10
 
 
 # ============================================================ 探索ロジック（ここから）
-def build_pool(data, mkt, short, long_, hold, cost, n_days):
-    """クロスが起きた日（銘柄×日）だけを集め、条件の判定値と購入後リターンを付ける。"""
-    cols = ["cross"] + [k for k, _ in BINARY] + sorted({c for _, c, *_ in VALUED})
+def build_pool(data, mkt, short, long_, hold, cost, n_days, trig="gc", pb_pct=5.0, rv_rsi=20.0):
+    """きっかけが出た日（銘柄×日）だけを集め、条件の判定値と購入後リターンを付ける。"""
+    cols = ["trig_" + trig] + [k for k, _ in BINARY] + sorted({c for _, c, *_ in VALUED})
     frames = []
     for code, df in data.items():
         if len(df) < 260:
             continue
-        x = compute(df, short, long_, mkt)
+        x = compute(df, short, long_, mkt, pb_pct, rv_rsi)
         t = x[cols].copy()
         t["ret"] = df["Close"].shift(-(hold + 1)) / df["Open"].shift(-1) - 1 - cost
         t["code"] = code
         t = t.iloc[-n_days:]
-        frames.append(t[t["cross"] & t["ret"].notna()])
+        frames.append(t[t["trig_" + trig] & t["ret"].notna()])
     if not frames:
         return None
     return pd.concat(frames).sort_index()
@@ -171,6 +171,12 @@ with st.expander("① 銘柄", expanded=False):
     text = st.text_area("1行1銘柄", value=SAMPLE, height=180)
 
 with st.expander("② 売買の条件", expanded=True):
+    trig = st.radio("買いのきっかけ", list(TRIGGERS), format_func=lambda k: TRIGGERS[k]["label"],
+                    help="このきっかけが出た日を土台にして、条件の組み合わせを探します。")
+    st.caption(TRIGGERS[trig]["desc"])
+    ca, cb = st.columns(2)
+    pb_pct = float(ca.number_input("押し目の深さ（%）", 1.0, 20.0, 5.0, 0.5, help="押し目買いで使います。推奨: 5%前後。"))
+    rv_rsi = float(cb.number_input("逆張りのRSI(3)基準", 1.0, 50.0, 20.0, 1.0, help="短期逆張りで使います。推奨: 20前後。"))
     c1, c2, c3 = st.columns(3)
     short = int(c1.number_input("短期線（日）", 2, 50, 5))
     long_ = int(c2.number_input("長期線（日）", 5, 200, 25))
@@ -203,15 +209,15 @@ if st.button("▶ 自動探索を実行", type="primary", width="stretch"):
         st.error(f"株価の取得に失敗しました: {e}")
         st.stop()
     mkt = fetch_market(period)
-    pool = build_pool(data, mkt, short, long_, hold, cost, n_days)
+    pool = build_pool(data, mkt, short, long_, hold, cost, n_days, trig, pb_pct, rv_rsi)
     if pool is None or len(pool) < 100:
-        st.error("検証できるクロスの件数が少なすぎます（銘柄を増やすか、検証期間を長くしてください）。")
+        st.error("検証できるシグナルの件数が少なすぎます（銘柄を増やすか、検証期間を長くしてください）。")
         st.stop()
     with st.spinner("条件の組み合わせを試しています..."):
         st.session_state["auto"] = search(pool, mkt is not None, max_k, win_pct / 100,
                                           "win" if objective_label.startswith("勝率") else "mean",
                                           min_tr, min_te, n_perm)
-        st.session_state["auto"].update(hold=hold, win_pct=win_pct, n_codes=len(data),
+        st.session_state["auto"].update(trig=TRIGGERS[trig]["label"], hold=hold, win_pct=win_pct, n_codes=len(data),
                                         mkt_ok=mkt is not None, t0=pool.index.min(), t1=pool.index.max())
 
 if "auto" not in st.session_state:
@@ -221,10 +227,10 @@ R = st.session_state["auto"]
 B = R["base"]
 st.divider()
 st.write(f"対象 {R['n_codes']} 銘柄 / 期間 {R['t0']:%Y-%m-%d} 〜 {R['t1']:%Y-%m-%d} / "
-         f"クロス {R['n_rows']} 件 / 試した組み合わせ **{R['n_combos']:,} 通り**")
+         f"きっかけ「{R['trig']}」のシグナル {R['n_rows']} 件 / 試した組み合わせ **{R['n_combos']:,} 通り**")
 if not R["mkt_ok"]:
     st.caption("※日経平均を取得できなかったため、地合いの条件は使っていません。")
-st.write(f"基準（クロスだけで買った場合）: 前半の勝率 **{B['wr_tr'] * 100:.1f}%**（{B['n_tr']}件）／"
+st.write(f"基準（きっかけだけで買った場合）: 前半の勝率 **{B['wr_tr'] * 100:.1f}%**（{B['n_tr']}件）／"
          f"後半の勝率 **{B['wr_te'] * 100:.1f}%**（{B['n_te']}件）。"
          f"勝ち＝購入後{R['hold']}営業日でリターン{R['win_pct']:g}%以上。")
 
@@ -275,7 +281,7 @@ st.info(
     "読み方の注意\n\n"
     "- 「偶然でも出る範囲」と出たときは、上位の組み合わせを使わないほうが安全です。\n"
     "- 件数が少ない組み合わせは、結果がぶれやすいです。後半の件数も見てください。\n"
-    "- 同じ日に多数の銘柄でクロスが出ると、相場全体の動きに結果が左右されます。\n"
+    "- 同じ日に多数の銘柄でシグナルが出ると、相場全体の動きに結果が左右されます。\n"
     "- 今も上場している銘柄だけで調べているため、実際より成績が良く出やすいです（生存者バイアス）。\n"
     "- 探索の結果は、期間や銘柄を変えると変わります。銘柄を増やして、何度か試してください。"
 )
