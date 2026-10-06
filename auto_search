@@ -1,0 +1,282 @@
+"""自動探索ページ：条件の組み合わせを自動で試し、「前半で選んで後半で確かめる」方法で高勝率の条件を探す"""
+from itertools import combinations, product
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from gc_core import SAMPLE, compute, fetch_all, fetch_market, parse_tickers
+
+st.set_page_config(page_title="自動探索", page_icon="🧭", layout="centered")
+
+BINARY = [
+    ("rising", "長期線が上向き"), ("above75", "株価が75日線より上"), ("above200", "株価が200日線より上"),
+    ("perfect", "パーフェクトオーダー"), ("market", "日経平均が75日線より上"), ("bullish", "クロス日が陽線"),
+    ("breakout", "直近20日の高値更新"), ("macd", "MACDがシグナルより上"),
+]
+VALUED = [  # (ID, 列名, 表示, 比較, 試す値)  ※同じ列でも向きが違えば別の条件として扱う
+    ("vol", "vol_x", "出来高が平均の{}倍以上", ">=", [1.5, 2.0, 3.0]),
+    ("volmax", "vol_x", "出来高が平均の{}倍以下", "<=", [2.0, 3.0, 5.0]),
+    ("value", "value_m", "平均売買代金{}百万円以上", ">=", [100, 300, 1000]),
+    ("rsi", "rsi_v", "RSIが{}以下", "<=", [60, 70, 75]),
+    ("dev", "dev_v", "長期線との乖離{}%以下", "<=", [5, 10, 15]),
+    ("atr", "atr_v", "ATR(値動き)が株価の{}%以下", "<=", [3, 5, 7]),
+    ("near52", "near52_v", "52週高値の{}%以上", ">=", [80, 90, 95]),
+    ("jump", "jump_v", "クロス日の上昇率{}%以下", "<=", [3, 5, 8]),
+]
+TOP = 10
+
+
+# ============================================================ 探索ロジック（ここから）
+def build_pool(data, mkt, short, long_, hold, cost, n_days):
+    """クロスが起きた日（銘柄×日）だけを集め、条件の判定値と購入後リターンを付ける。"""
+    cols = ["cross"] + [k for k, _ in BINARY] + sorted({c for _, c, *_ in VALUED})
+    frames = []
+    for code, df in data.items():
+        if len(df) < 260:
+            continue
+        x = compute(df, short, long_, mkt)
+        t = x[cols].copy()
+        t["ret"] = df["Close"].shift(-(hold + 1)) / df["Open"].shift(-1) - 1 - cost
+        t["code"] = code
+        t = t.iloc[-n_days:]
+        frames.append(t[t["cross"] & t["ret"].notna()])
+    if not frames:
+        return None
+    return pd.concat(frames).sort_index()
+
+
+def build_combos(pool, use_market, max_k):
+    atoms = {}
+    for key, label in BINARY:
+        if key == "market" and not use_market:
+            continue
+        atoms[key] = [(label, pool[key].to_numpy(bool))]
+    for cid, col, fmt, op, vals in VALUED:
+        arr = pool[col].to_numpy(float)
+        atoms[cid] = [(fmt.format(v), (arr >= v) if op == ">=" else (arr <= v)) for v in vals]
+    labels, masks, seen = [], [], set()
+    for k in range(1, max_k + 1):  # 条件の少ない順に作るので、同じ対象なら少ない条件のほうが残る
+        for ks in combinations(list(atoms), k):
+            for opt in product(*[atoms[a] for a in ks]):
+                m = opt[0][1].copy()
+                for o in opt[1:]:
+                    m &= o[1]
+                key = m.tobytes()
+                if m.all() or key in seen:  # 全件と同じ／すでにある組み合わせと同じ対象は除く
+                    continue
+                seen.add(key)
+                labels.append(" ＋ ".join(o[0] for o in opt))
+                masks.append(m)
+    return labels, np.array(masks)
+
+
+def wilson_lb(p, n, z=1.96):
+    n = np.maximum(n, 1)
+    return (p + z * z / (2 * n) - z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / (1 + z * z / n)
+
+
+def group_stats(M, ret, win):
+    """M: (組み合わせ数 × 行数) の0/1行列。各組み合わせの 件数・勝率・平均・分散。"""
+    n = M.sum(1)
+    nn = np.maximum(n, 1)
+    mean = (M @ ret) / nn
+    var = (M @ (ret ** 2)) / nn - mean ** 2
+    return n, (M @ win) / nn, mean, var
+
+
+def score_of(objective, n, wr, mean, var):
+    if objective == "win":
+        return wilson_lb(wr, n)
+    return mean / np.sqrt(np.maximum(var, 1e-12) / np.maximum(n, 1))
+
+
+def pick(score, n_tr, n_te, min_tr, min_te, top=TOP):
+    sc = np.where((n_tr >= min_tr) & (n_te >= min_te), score, -np.inf)
+    idx = np.argsort(-sc)[:top]
+    return idx[np.isfinite(sc[idx])]
+
+
+def search(pool, use_market, max_k, thr, objective, min_tr, min_te, n_perm, seed=0):
+    mid = pool.index.min() + (pool.index.max() - pool.index.min()) / 2
+    tr = np.asarray(pool.index <= mid)
+    te = ~tr
+    labels, masks = build_combos(pool, use_market, max_k)
+    ret = pool["ret"].to_numpy(np.float32)
+    Mtr, Mte = masks[:, tr].astype(np.float32), masks[:, te].astype(np.float32)
+    rtr, rte = ret[tr], ret[te]
+    wtr, wte = (rtr >= thr).astype(np.float32), (rte >= thr).astype(np.float32)
+
+    n_tr, wr_tr, mu_tr, var_tr = group_stats(Mtr, rtr, wtr)
+    n_te, wr_te, mu_te, var_te = group_stats(Mte, rte, wte)
+    train_score = score_of(objective, n_tr, wr_tr, mu_tr, var_tr)
+    idx = pick(train_score, n_tr, n_te, min_tr, min_te)
+
+    # 上位30件の中で、繰り返し登場する条件を数える（似た組み合わせが並ぶので、核になる条件を見つけるため）
+    from collections import Counter
+    cnt = Counter(a for i in pick(train_score, n_tr, n_te, min_tr, min_te, top=30) for a in labels[i].split(" ＋ "))
+    freq = pd.DataFrame([{"条件": k, "上位30件での登場回数": v} for k, v in cnt.most_common(8)])
+
+    base = dict(n_tr=len(rtr), n_te=len(rte), wr_tr=float(wtr.mean()), wr_te=float(wte.mean()),
+                mu_tr=float(rtr.mean()), mu_te=float(rte.mean()))
+    gain = lambda w, m: (w - base["wr_te"]) * 100 if objective == "win" else (m - base["mu_te"]) * 100
+    obs = float(np.mean(gain(wr_te[idx], mu_te[idx]))) if len(idx) else float("nan")
+
+    # 偶然の目安：前半・後半それぞれの中で値動きをシャッフルし、同じ手順で「選んで確かめる」
+    rng = np.random.default_rng(seed)
+    null = []
+    for _ in range(n_perm):
+        a, b = rng.permutation(rtr), rng.permutation(rte)
+        wa, wb = (a >= thr).astype(np.float32), (b >= thr).astype(np.float32)
+        s_n, s_w, s_m, s_v = group_stats(Mtr, a, wa)
+        j = pick(score_of(objective, s_n, s_w, s_m, s_v), n_tr, n_te, min_tr, min_te)
+        if len(j) == 0:
+            continue
+        _, w2, m2, _ = group_stats(Mte[j], b, wb)
+        g = (w2 - wb.mean()) * 100 if objective == "win" else (m2 - b.mean()) * 100
+        null.append(float(np.mean(g)))
+    null = np.array(null)
+
+    # 上位候補の詳細（4つの期間に分けた安定性も確認）
+    q = pd.qcut(pool.index.to_series().rank(method="first"), 4, labels=False).to_numpy()
+    allwin = (ret >= thr)
+    rows = []
+    for i in idx:
+        m = masks[i]
+        beat = 0
+        for b in range(4):
+            sel = m & (q == b)
+            if sel.sum() >= 8 and allwin[sel].mean() > allwin[q == b].mean():
+                beat += 1
+        ok = bool(wr_te[i] > base["wr_te"] and mu_te[i] > base["mu_te"])
+        rows.append({
+            "条件の組み合わせ": labels[i],
+            "前半 件数": int(n_tr[i]), "前半 勝率%": round(float(wr_tr[i]) * 100, 1), "前半 平均%": round(float(mu_tr[i]) * 100, 2),
+            "後半 件数": int(n_te[i]), "後半 勝率%": round(float(wr_te[i]) * 100, 1), "後半 平均%": round(float(mu_te[i]) * 100, 2),
+            "後半の勝率差(pt)": round((float(wr_te[i]) - base["wr_te"]) * 100, 1),
+            "4期間で基準超え": f"{beat}/4",
+            "判定": "◎ 後半でも有効" if ok else "× 後半は不発",
+        })
+    p_val = float((np.sum(null >= obs) + 1) / (len(null) + 1)) if len(null) and np.isfinite(obs) else float("nan")
+    return dict(table=pd.DataFrame(rows), base=base, n_combos=len(labels), n_rows=len(pool), obs=obs,
+                null=null, p=p_val, mid=mid, objective=objective, freq=freq)
+# ============================================================ 探索ロジック（ここまで）
+
+
+st.title("🧭 自動探索")
+st.caption("条件の組み合わせを自動でたくさん試し、勝率の高い条件を探します。"
+           "偶然よく見える組み合わせを選んでしまわないよう、「前半で選び、後半で確かめる」方法を使います。")
+
+with st.expander("① 銘柄", expanded=False):
+    text = st.text_area("1行1銘柄", value=SAMPLE, height=180)
+
+with st.expander("② 売買の条件", expanded=True):
+    c1, c2, c3 = st.columns(3)
+    short = int(c1.number_input("短期線（日）", 2, 50, 5))
+    long_ = int(c2.number_input("長期線（日）", 5, 200, 25))
+    hold = int(c3.number_input("保有日数（購入後）", 1, 250, 15, help="購入日から数えて何営業日後に売るか。推奨: 15日。"))
+    c4, c5, c6 = st.columns(3)
+    win_pct = c4.number_input("勝ちの基準（%以上）", -20.0, 50.0, 0.0, 0.5, help="コスト引き後のリターンがこの値以上なら勝ち。推奨: 0%。")
+    n_days = int(c5.number_input("検証期間（営業日）", 250, 1500, 1000, 50, help="推奨: 1000日。"))
+    cost = c6.number_input("売買コスト（往復%）", 0.0, 3.0, 0.2, 0.1, help="推奨: 0.2%前後。") / 100
+
+with st.expander("③ 探索の設定", expanded=False):
+    objective_label = st.radio("良い条件の基準", ["勝率（件数が少ないと割り引いて比べる）", "平均リターン"],
+                               help="推奨: 勝率。件数の少ない組み合わせが上位に来にくくなります。")
+    c7, c8 = st.columns(2)
+    max_k = int(c7.slider("同時に使う条件の最大数", 1, 3, 3, help="推奨: 3。増やすほど偶然よく見える組み合わせも増えます。"))
+    n_perm = int(c8.slider("偶然チェックの回数", 20, 300, 100, 20, help="推奨: 100回以上。"))
+    c9, c10 = st.columns(2)
+    min_tr = int(c9.number_input("前半の最小件数", 10, 500, 30, 5, help="推奨: 30件以上。"))
+    min_te = int(c10.number_input("後半の最小件数", 5, 500, 20, 5, help="推奨: 20件以上。"))
+
+if st.button("▶ 自動探索を実行", type="primary", width="stretch"):
+    items = parse_tickers(text)
+    if not items or short >= long_:
+        st.warning("銘柄を入力し、短期線は長期線より小さくしてください。")
+        st.stop()
+    codes = [c for c, _ in items]
+    period = f"{min(int(np.ceil((n_days + hold) / 245)) + 2, 10)}y"
+    try:
+        data = fetch_all(codes, period)
+    except Exception as e:
+        st.error(f"株価の取得に失敗しました: {e}")
+        st.stop()
+    mkt = fetch_market(period)
+    pool = build_pool(data, mkt, short, long_, hold, cost, n_days)
+    if pool is None or len(pool) < 100:
+        st.error("検証できるクロスの件数が少なすぎます（銘柄を増やすか、検証期間を長くしてください）。")
+        st.stop()
+    with st.spinner("条件の組み合わせを試しています..."):
+        st.session_state["auto"] = search(pool, mkt is not None, max_k, win_pct / 100,
+                                          "win" if objective_label.startswith("勝率") else "mean",
+                                          min_tr, min_te, n_perm)
+        st.session_state["auto"].update(hold=hold, win_pct=win_pct, n_codes=len(data),
+                                        mkt_ok=mkt is not None, t0=pool.index.min(), t1=pool.index.max())
+
+if "auto" not in st.session_state:
+    st.stop()
+
+R = st.session_state["auto"]
+B = R["base"]
+st.divider()
+st.write(f"対象 {R['n_codes']} 銘柄 / 期間 {R['t0']:%Y-%m-%d} 〜 {R['t1']:%Y-%m-%d} / "
+         f"クロス {R['n_rows']} 件 / 試した組み合わせ **{R['n_combos']:,} 通り**")
+if not R["mkt_ok"]:
+    st.caption("※日経平均を取得できなかったため、地合いの条件は使っていません。")
+st.write(f"基準（クロスだけで買った場合）: 前半の勝率 **{B['wr_tr'] * 100:.1f}%**（{B['n_tr']}件）／"
+         f"後半の勝率 **{B['wr_te'] * 100:.1f}%**（{B['n_te']}件）。"
+         f"勝ち＝購入後{R['hold']}営業日でリターン{R['win_pct']:g}%以上。")
+
+st.subheader("1. 前半で選んだ上位の条件を、後半で確かめた結果")
+T = R["table"]
+if T.empty:
+    st.info("件数の条件を満たす組み合わせがありませんでした。「最小件数」を下げるか、銘柄を増やしてください。")
+    st.stop()
+st.dataframe(T, hide_index=True, width="stretch")
+st.caption("「前半」で上位の組み合わせを選び、「後半」の成績で確かめています（後半のデータは選ぶときに使っていません）。"
+           "「4期間で基準超え」は、全期間を4つに分けたうち、基準の勝率を上回った期間の数です。"
+           "上位には似た組み合わせが並びやすいので、下の「繰り返し登場する条件」も見てください。")
+if len(R["freq"]):
+    st.markdown("**繰り返し登場する条件**（前半の上位30件の中で）")
+    st.dataframe(R["freq"], hide_index=True, width="stretch")
+
+st.subheader("2. 偶然でも出る水準との比較")
+unit = "勝率の差（pt）" if R["objective"] == "win" else "平均リターンの差（pt）"
+null, obs = R["null"], R["obs"]
+if len(null):
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"実際：後半の{unit}", f"{obs:+.2f}")
+    c2.metric("偶然の平均", f"{null.mean():+.2f}")
+    c3.metric("偶然の上位5%", f"{np.percentile(null, 95):+.2f}")
+    if R["p"] < 0.05:
+        st.success(f"実際の値が、偶然では出にくい水準を超えています（偶然で同じ以上になる確率 約{R['p'] * 100:.0f}%）。"
+                   "上位の組み合わせには、一定の再現性が期待できます。")
+    else:
+        st.warning(f"実際の値は、偶然でも出る範囲です（偶然で同じ以上になる確率 約{R['p'] * 100:.0f}%）。"
+                   "上位に見える組み合わせは、たまたまよく見えている可能性が高いです。")
+    st.caption(f"{len(null)}回、値動きを入れ替えて同じ手順を繰り返した結果と比べています。"
+               "「上位{0}件の、後半での平均的な改善幅」を比べています。".format(TOP))
+
+good = T[T["判定"].str.startswith("◎")]
+reliable = len(null) > 0 and R["p"] < 0.05
+st.subheader("3. 候補のまとめ")
+if len(good) == 0:
+    st.write("後半でも基準を上回った組み合わせはありませんでした。この設定・銘柄では、はっきり効く条件は見つかっていません。")
+elif not reliable:
+    st.write(f"後半でも基準を上回った組み合わせが {len(good)} 件ありますが、**偶然でも出る範囲**（上の比較）のため、"
+             "おすすめはしません。銘柄を増やす・期間を変えるなどして、もう一度試してください。")
+else:
+    st.write(f"後半でも基準を上回ったのは **{len(good)} 件** です。スクリーニングの条件に入れて試す候補:")
+    for _, r in good.head(3).iterrows():
+        st.markdown(f"- **{r['条件の組み合わせ']}**（後半 {r['後半 件数']}件・勝率 {r['後半 勝率%']}%・4期間で基準超え {r['4期間で基準超え']}）")
+
+st.info(
+    "読み方の注意\n\n"
+    "- 「偶然でも出る範囲」と出たときは、上位の組み合わせを使わないほうが安全です。\n"
+    "- 件数が少ない組み合わせは、結果がぶれやすいです。後半の件数も見てください。\n"
+    "- 同じ日に多数の銘柄でクロスが出ると、相場全体の動きに結果が左右されます。\n"
+    "- 今も上場している銘柄だけで調べているため、実際より成績が良く出やすいです（生存者バイアス）。\n"
+    "- 探索の結果は、期間や銘柄を変えると変わります。銘柄を増やして、何度か試してください。"
+)
+st.caption("過去の結果は将来を保証しません。投資判断の材料の一つです。")
