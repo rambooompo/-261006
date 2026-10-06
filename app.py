@@ -6,9 +6,9 @@ from gc_core import SAMPLE, compute, fetch_all, fetch_market, fetch_pbr, parse_t
 
 st.set_page_config(page_title="ゴールデンクロス検出", page_icon="📈", layout="centered")
 
-st.title("📈 ゴールデンクロス検出")
-st.caption("短期線が長期線を上抜け、条件をすべて満たした銘柄を探します。株価はYahoo Finance（遅延・欠損あり）。"
-           "条件の効果は左上メニューの「backtest」で過去検証できます。")
+st.title("📈 買いシグナル検出")
+st.caption("選んだ「買いのきっかけ」が出て、条件をすべて満たした銘柄を探します。株価はYahoo Finance（遅延・欠損あり）。"
+           "きっかけ同士の比較や条件の効果は、左上メニューの「backtest」で過去検証できます。")
 
 with st.expander("① 銘柄を入力", expanded=False):
     text = st.text_area("1行1銘柄（「7203」または「7203,トヨタ」）", value=SAMPLE, height=200)
@@ -51,21 +51,21 @@ if st.button("▶ スクリーニング開始", type="primary", width="stretch")
     for code, df in data.items():
         if len(df) < p["long"] + p["days"] + 2:
             continue
-        x = compute(df, p["short"], p["long"], mkt)
+        x = compute(df, p["short"], p["long"], mkt, p["pb_pct"], p["rv_rsi"])
         sig = signal(x, p).iloc[-p["days"]:]
-        if not sig.any() or not bool(x["above_now"].iloc[-1]):
+        if not sig.any() or (p["trigger"] == "gc" and not bool(x["above_now"].iloc[-1])):
             continue
-        d = sig[sig].index[-1]  # クロス日
+        d = sig[sig].index[-1]  # シグナル日
         last = x.iloc[-1]
         rows.append({
-            "コード": code, "銘柄名": names.get(code, ""), "クロス日": d.strftime("%Y-%m-%d"),
+            "コード": code, "銘柄名": names.get(code, ""), "シグナル日": d.strftime("%Y-%m-%d"),
             "終値": round(float(last["close"]), 1),
             "短期線": round(float(last["sma_s"]), 1), "長期線": round(float(last["sma_l"]), 1),
-            "RSI": round(float(last["rsi_v"]), 1), "乖離率%": round(float(last["dev_v"]), 1),
+            "RSI": round(float(last["rsi_v"]), 1), "RSI(3)": round(float(last["rsi3_v"]), 1), "乖離率%": round(float(last["dev_v"]), 1),
             "出来高倍率": round(float(x.loc[d, "vol_x"]), 2) if pd.notna(x.loc[d, "vol_x"]) else None,
             "ATR%": round(float(last["atr_v"]), 1),
             "52週高値比%": round(float(last["near52_v"]), 1) if pd.notna(last["near52_v"]) else None,
-            "クロス日の上昇率%": round(float(x.loc[d, "jump_v"]), 1) if pd.notna(x.loc[d, "jump_v"]) else None,
+            "シグナル日の上昇率%": round(float(x.loc[d, "jump_v"]), 1) if pd.notna(x.loc[d, "jump_v"]) else None,
             "売買代金(百万円)": round(float(last["value_m"]), 1),
             "チャート": f"https://finance.yahoo.co.jp/quote/{code}.T/chart",
         })
@@ -87,7 +87,7 @@ if st.button("▶ スクリーニング開始", type="primary", width="stretch")
     if not rows:
         st.info(f"該当なし。対象 {len(codes)} 銘柄 {note}\n\n条件を減らすか、「直近N営業日以内」を増やすと見つかる場合があります。")
     else:
-        res = pd.DataFrame(rows).sort_values("クロス日", ascending=False)
+        res = pd.DataFrame(rows).sort_values("シグナル日", ascending=False)
         res = res[[c for c in res.columns if c != "チャート"] + ["チャート"]]  # チャートのリンクを右端に
         st.success(f"該当 {len(res)} 銘柄 / 対象 {len(codes)} 銘柄 {note}")
         st.dataframe(res, hide_index=True, width="stretch",
@@ -95,4 +95,4 @@ if st.button("▶ スクリーニング開始", type="primary", width="stretch")
         st.download_button("CSVでダウンロード", res.drop(columns="チャート").to_csv(index=False).encode("utf-8-sig"),
                            file_name="golden_cross.csv", mime="text/csv", width="stretch")
 
-st.caption("条件はクロス日の時点で判定しています（過去検証と同じ基準）。投資判断の材料の一つです。利益を保証するものではありません。")
+st.caption("条件はシグナル日の時点で判定しています（過去検証と同じ基準）。投資判断の材料の一つです。利益を保証するものではありません。")
