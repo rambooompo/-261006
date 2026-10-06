@@ -123,6 +123,16 @@ SAMPLE = """7203,トヨタ自動車
 8766,東京海上ホールディングス
 8801,三井不動産"""
 
+# ------------------------------------------------------------ 買いのきっかけ（エントリー）
+TRIGGERS = {
+    "gc": dict(label="ゴールデンクロス", desc="短期線が長期線を下から上に抜けた日。"),
+    "pullback": dict(label="押し目買い", desc="上昇トレンド中（長期線＞75日線、75日線が上向き）に、株価が長期線より"
+                                             "◯%以上下に沈んだ最初の日。上昇中の一時的な下げを拾います。"),
+    "breakout": dict(label="52週高値ブレイク", desc="終値が過去約1年の最高値（前日までの52週高値）を初めて上回った日。"),
+    "reversal": dict(label="短期逆張り", desc="長期の上昇トレンド中（株価＞200日線）に、短期RSI(3)が◯以下まで"
+                                            "売られた最初の日。上昇中の短い売られすぎを拾います。"),
+}
+
 # ------------------------------------------------------------ 条件の定義
 # rec = 画面に出す推奨値（一般的な目安）。help = 「?」を押すと出る説明。
 CONDS = [
@@ -140,10 +150,10 @@ CONDS = [
          help="終値が過去約1年の最高値にどれだけ近いか。52週高値に近い株ほど、その後のリターンが高い傾向があるという研究"
               "（George & Hwang 2004、米国株）に基づく条件。日本株での効果は自動探索で確認してください。"),
     # --- 出来高・流動性
-    dict(key="vol", group="出来高・流動性", label="クロス日の出来高が平均の◯倍以上", on=True, rec="推奨: 1.5〜2.0倍",
+    dict(key="vol", group="出来高・流動性", label="シグナル日の出来高が平均の◯倍以上", on=True, rec="推奨: 1.5〜2.0倍",
          val=dict(label="出来高倍率（倍）", default=1.5, min=0.5, max=10.0, step=0.5),
-         help="クロス日の出来高が直近20日平均より多いこと。買いが本当に入っているかの確認です。"),
-    dict(key="volmax", group="出来高・流動性", label="クロス日の出来高が平均の◯倍以下【新】", on=False,
+         help="シグナル日の出来高が直近20日平均より多いこと。買いが本当に入っているかの確認です。"),
+    dict(key="volmax", group="出来高・流動性", label="シグナル日の出来高が平均の◯倍以下【新】", on=False,
          rec="推奨: 検証で判断（目安3倍）",
          val=dict(label="出来高倍率の上限（倍）", default=3.0, min=1.0, max=20.0, step=0.5),
          help="出来高が極端に多い日を除きます。売買が多い銘柄ほど、その後のリターンが低く、上昇の反転も早いという研究"
@@ -158,7 +168,7 @@ CONDS = [
     dict(key="dev", group="過熱感", label="長期線との乖離が◯％以下", on=True, rec="推奨: 5〜10%",
          val=dict(label="乖離率上限（%）", default=10.0, min=1.0, max=50.0, step=1.0),
          help="株価が長期線からどれだけ離れているか。大きいほど、すでに上がりきった後のクロスです。"),
-    dict(key="jump", group="過熱感", label="クロス日の上昇率が◯%以下【新】", on=False, rec="推奨: 検証で判断（目安5%）",
+    dict(key="jump", group="過熱感", label="シグナル日の上昇率が◯%以下【新】", on=False, rec="推奨: 検証で判断（目安5%）",
          val=dict(label="前日比の上限（%）", default=5.0, min=0.0, max=30.0, step=0.5),
          help="急騰した日のクロスを除きます。日本株では1日に大きく上がった株が直後の数日で下がりやすいという研究"
               "（Pham 2007）があります。ただし影響は短期で、主な効果は「高値で買わない」ことです。"),
@@ -168,7 +178,7 @@ CONDS = [
     # --- 地合い・タイミング
     dict(key="market", group="地合い・タイミング", label="日経平均が75日線より上【新】", on=True, rec="推奨: ON",
          help="相場全体が下落基調のときは、個別株のクロスも失敗しやすいと言われます。相場全体の向きで絞ります。"),
-    dict(key="bullish", group="地合い・タイミング", label="クロス日が陽線（終値＞始値）【新】", on=False, rec="推奨: 検証で判断",
+    dict(key="bullish", group="地合い・タイミング", label="シグナル日が陽線（終値＞始値）【新】", on=False, rec="推奨: 検証で判断",
          help="クロスした日にしっかり買われて引けたか。弱い形のクロスを除きます。"),
     dict(key="breakout", group="地合い・タイミング", label="終値が直近20日の最高値【新】", on=False, rec="推奨: 検証で判断",
          help="クロスと同時に直近の高値を抜けたか（ブレイクアウト）。強い動きだけに絞りますが、件数は減ります。"),
@@ -181,16 +191,29 @@ COND_LABEL = {c["key"]: c["label"].replace("【新】", "") for c in CONDS}
 def render_conditions(show_days=True, key_prefix=""):
     """条件の入力画面を出して、設定値の辞書を返す。"""
     p = {}
-    with st.expander("② クロスの条件", expanded=True):
+    with st.expander("② 買いのきっかけ", expanded=True):
+        p["trigger"] = st.radio("きっかけ", list(TRIGGERS), format_func=lambda k: TRIGGERS[k]["label"],
+                                key=key_prefix + "trigger",
+                                help="どのタイミングで買うか。過去検証ページでは、4つのきっかけを同じ条件で比べられます。")
+        st.caption(TRIGGERS[p["trigger"]]["desc"])
         cols = st.columns(3 if show_days else 2)
         p["short"] = int(cols[0].number_input("短期線（日）", 2, 50, 5, key=key_prefix + "short",
-                                              help="推奨: 5日。短いほど早くクロスしますが、だましも増えます。"))
+                                              help="推奨: 5日。ゴールデンクロスで使います。"))
         p["long"] = int(cols[1].number_input("長期線（日）", 5, 200, 25, key=key_prefix + "long",
-                                             help="推奨: 25日。日本では5日×25日の組み合わせが一般的です。"))
+                                             help="推奨: 25日。ゴールデンクロスと押し目買いで使います。"))
         if show_days:
             p["days"] = int(cols[2].number_input("直近N営業日以内", 1, 20, 1, key=key_prefix + "days",
-                                                 help="推奨: 1〜3日。大きくすると、少し前のクロスも拾います。"))
-        st.caption("推奨: 短期5日・長期25日・直近1〜3日")
+                                                 help="推奨: 1〜3日。大きくすると、少し前のシグナルも拾います。"))
+        c4, c5 = st.columns(2)
+        p["pb_pct"] = float(c4.number_input("押し目の深さ（長期線から◯%下）", 1.0, 20.0, 5.0, 0.5,
+                                            key=key_prefix + "pb_pct",
+                                            help="押し目買いで使います。推奨: 5%前後。深いほど件数は減りますが、"
+                                                 "反発が大きい傾向があるという検証があります。"))
+        p["rv_rsi"] = float(c5.number_input("逆張りのRSI(3)基準（◯以下）", 1.0, 50.0, 20.0, 1.0,
+                                            key=key_prefix + "rv_rsi",
+                                            help="短期逆張りで使います。推奨: 20前後（10〜20）。小さいほど強い売られすぎです。"))
+        st.caption("推奨: 短期5日・長期25日・直近1〜3日・押し目5%・RSI(3)20以下。"
+                   "きっかけを変えたら、③の絞り込み（特に出来高・乖離の条件）も見直してください。")
 
     groups = []
     for c in CONDS:
@@ -220,8 +243,8 @@ def rsi_wilder(close, n=14):
     return 100 - 100 / (1 + rs)
 
 
-def compute(df, short, long_, mkt_ok=None):
-    """各日の指標と、各条件を満たしたかを計算（その日までのデータだけを使う）。"""
+def compute(df, short, long_, mkt_ok=None, pb_pct=5.0, rv_rsi=20.0):
+    """各日の指標・各条件・各きっかけを計算（その日までのデータだけを使う）。"""
     c, o, v = df["Close"], df["Open"], df["Volume"]
     h = df["High"] if "High" in df else c
     lo = df["Low"] if "Low" in df else c
@@ -255,6 +278,18 @@ def compute(df, short, long_, mkt_ok=None):
         x["market"] = mkt_ok.reindex(x.index, method="ffill").fillna(False).astype(bool)
     else:
         x["market"] = True
+
+    # --- 買いのきっかけ（どれも「条件を満たした最初の日」だけを1回のシグナルとする）
+    x["trig_gc"] = x["cross"]
+    up = (l > m75) & (m75 > m75.shift(5))
+    deep = x["dev_v"] <= -pb_pct
+    x["trig_pullback"] = up & deep & ~deep.shift(1, fill_value=False)
+    brk = c > h.shift(1).rolling(245, min_periods=200).max()
+    x["trig_breakout"] = brk & ~brk.shift(1, fill_value=False)
+    rsi3 = rsi_wilder(c, 3)
+    low = rsi3 <= rv_rsi
+    x["trig_reversal"] = (c > m200) & low & ~low.shift(1, fill_value=False)
+    x["rsi3_v"] = rsi3
     return x
 
 
@@ -273,7 +308,7 @@ def masks(x, p):
 
 def signal(x, p, m=None):
     m = m or masks(x, p)
-    sig = x["cross"].copy()
+    sig = x["trig_" + p.get("trigger", "gc")].copy()
     for c in CONDS:
         if p.get(c["key"] + "_on"):
             sig &= m[c["key"]]
