@@ -329,6 +329,97 @@ def parse_tickers(text):
     return items
 
 
+# ------------------------------------------------------------ 銘柄の範囲（JPX公式の上場銘柄一覧から選ぶ）
+JPX_PAGE = "https://www.jpx.co.jp/markets/statistics-equities/misc/01.html"
+JPX_FILE = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xlsx"
+UNIVERSES = {
+    "topix500": "TOPIX500（大型・中型株 約500銘柄）",
+    "small500": "TOPIX Small 500（小型株 約500銘柄）",
+    "prime": "プライム市場からランダムに500銘柄",
+    "growth": "グロース市場からランダムに最大500銘柄",
+    "manual": "手入力（下の欄の銘柄）",
+}
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_jpx_list():
+    """東証の上場銘柄一覧（毎月更新）を読み込み、内国株式だけを返す。列: code, name, market, size"""
+    import io
+    import re
+    from urllib.parse import urljoin
+
+    import requests
+
+    hdr = {"User-Agent": "Mozilla/5.0"}
+    url = JPX_FILE
+    try:  # ページからファイルの最新の場所を探す（見つからなければ既定の場所）
+        html = requests.get(JPX_PAGE, headers=hdr, timeout=20).text
+        m = re.search(r'href="([^"]*data_j\.xlsx?)"', html)
+        if m:
+            url = urljoin(JPX_PAGE, m.group(1))
+    except Exception:
+        pass
+    res = requests.get(url, headers=hdr, timeout=60)
+    res.raise_for_status()
+    df = pd.read_excel(io.BytesIO(res.content), dtype=str)
+
+    def col(key):
+        return key if key in df.columns else next(c for c in df.columns if key in str(c))
+
+    out = pd.DataFrame({
+        "code": df[col("コード")].astype(str).str.strip().str.replace(r"\.0$", "", regex=True),
+        "name": df[col("銘柄名")].astype(str).str.strip(),
+        "market": df[col("市場・商品区分")].fillna("").astype(str),
+        "size": df[col("規模区分")].fillna("").astype(str).str.strip(),
+    })
+    return out[out["market"].str.contains("内国株式")].reset_index(drop=True)
+
+
+def universe_items(kind, n=500, seed=0):
+    """銘柄の範囲から (コード, 銘柄名) のリストを返す。ランダムは毎回同じ銘柄になるよう固定。"""
+    df = load_jpx_list()
+    if kind == "topix500":
+        sel = df[df["size"].isin(["TOPIX Core30", "TOPIX Large70", "TOPIX Mid400"])]
+    elif kind == "small500":
+        sel = df[df["size"] == "TOPIX Small 1"]
+    elif kind == "prime":
+        sel = df[df["market"].str.startswith("プライム")]
+    elif kind == "growth":
+        sel = df[df["market"].str.startswith("グロース")]
+    else:
+        return []
+    if len(sel) > n:
+        sel = sel.sample(n, random_state=seed)
+    return list(zip(sel["code"], sel["name"]))
+
+
+def render_universe(key_prefix=""):
+    """「① 銘柄」の入力欄。(範囲の種類, 手入力の文字) を返す。"""
+    with st.expander("① 銘柄", expanded=False):
+        kind = st.selectbox("対象にする銘柄", list(UNIVERSES), format_func=lambda k: UNIVERSES[k],
+                            key=key_prefix + "universe",
+                            help="東証の公式の上場銘柄一覧（毎月更新）から自動で選びます。"
+                                 "推奨: 検証はTOPIX500か小型株500で。小型株のほうが、値動きの癖が残りやすいと言われます。")
+        st.caption("500銘柄だと、株価の取得に数分かかることがあります（同じ設定なら1時間は再取得しません）。")
+        text = st.text_area("手入力の銘柄（1行1銘柄。「手入力」を選んだときに使います）", value=SAMPLE, height=150,
+                            key=key_prefix + "manual_text")
+    return kind, text
+
+
+def resolve_items(kind, text):
+    """実行時に、対象の (コード, 銘柄名) を決める。一覧が取れなければ手入力の銘柄で代用。"""
+    if kind == "manual":
+        return parse_tickers(text)
+    try:
+        items = universe_items(kind)
+        if items:
+            return items
+        st.warning("銘柄一覧に該当する銘柄がありませんでした。手入力の銘柄で実行します。")
+    except Exception as e:
+        st.warning(f"東証の銘柄一覧を読み込めなかったため、手入力の銘柄で実行します（{type(e).__name__}）。")
+    return parse_tickers(text)
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_chunk(codes: tuple, period: str):
     import yfinance as yf
