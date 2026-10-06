@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from gc_core import (COND_LABEL, CONDS, SAMPLE, TRIGGERS, compute, fetch_all, fetch_market, masks, parse_tickers,
+from gc_core import (render_universe, resolve_items, COND_LABEL, CONDS, SAMPLE, TRIGGERS, compute, fetch_all, fetch_market, masks, parse_tickers,
                      render_conditions, signal)
 
 st.set_page_config(page_title="過去検証", page_icon="🔬", layout="centered")
@@ -22,8 +22,7 @@ st.title("🔬 過去検証")
 st.caption("買い＝シグナル（きっかけ）の翌営業日の始値。売り＝購入日から数えて指定した営業日後の終値（損切り・利確なし）。"
            "条件はその日までのデータだけで判定しています。")
 
-with st.expander("① 銘柄", expanded=False):
-    text = st.text_area("1行1銘柄", value=SAMPLE, height=180)
+kind, text = render_universe()
 
 p = render_conditions(show_days=False)
 with st.expander("④ 勝ちの条件・期間", expanded=True):
@@ -41,7 +40,7 @@ with st.expander("④ 勝ちの条件・期間", expanded=True):
 WIN_THR = win_pct / 100
 
 if st.button("▶ 検証を実行", type="primary", width="stretch"):
-    items = parse_tickers(text)
+    items = resolve_items(kind, text)
     if not items or p["short"] >= p["long"]:
         st.warning("銘柄を入力し、短期線は長期線より小さくしてください。")
         st.stop()
