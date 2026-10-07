@@ -1,0 +1,7 @@
+[client]
+# メニューを最小限にして、アプリらしい見た目にする
+toolbarMode = "minimal"
+
+[theme]
+base = "light"
+primaryColor = "#d33a2c"
