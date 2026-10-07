@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from gc_core import (render_universe, resolve_items, COND_LABEL, CONDS, SAMPLE, TRIGGERS, compute, fetch_all, fetch_market, masks, parse_tickers,
+from gc_core import (make_template, render_template_saver, render_universe, resolve_items, COND_LABEL, CONDS, SAMPLE, TRIGGERS, compute, fetch_all, fetch_market, masks, parse_tickers,
                      render_conditions, signal)
 
 st.set_page_config(page_title="過去検証", page_icon="🔬", layout="centered")
@@ -77,7 +77,7 @@ if st.button("▶ 検証を実行", type="primary", width="stretch"):
         st.error("検証できる株価データがありませんでした。")
         st.stop()
     st.session_state["bt"] = dict(T=pd.concat(frames), p=dict(p), mkt_ok=mkt is not None, n_codes=len(frames),
-                                  horizons=horizons, n_hold=n_hold)
+                                  horizons=horizons, n_hold=n_hold, universe=kind)
 
 if "bt" not in st.session_state:
     st.stop()
@@ -135,6 +135,15 @@ st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
 st.caption("勝率は、リターン（売買コスト引き後）が勝ちの基準以上だった割合。"
            "「平均%」が「きっかけのみ」や「毎日買った」を上回り、その差が「±(95%)」より大きければ、偶然ではない可能性が高まります。"
            "（◀設定＝上で指定した保有日数。5・10・20・40日は比較用です）")
+
+with st.expander("💾 この条件をテンプレとして保存", expanded=False):
+    _n, _w, _mu = stat(S[f"r{NH}"])
+    _label = TRIGGERS[pp["trigger"]]["label"]
+    _name = st.text_input("テンプレの名前", value=f"{_label} 勝率{_w:.0f}%（{pd.Timestamp.now():%m/%d}検証）",
+                          key="_tpl_name_bt")
+    _memo = (f"{_label}／購入後{NH}日・リターン{WIN_THR * 100:g}%以上で勝ち／"
+             f"過去検証：件数{_n}・勝率{_w:.1f}%・平均{_mu:.2f}%（{pd.Timestamp.now():%Y-%m-%d}）")
+    render_template_saver(make_template(_name, {**pp, "universe": bt.get("universe", "topix500")}, _memo))
 
 h = st.selectbox("以下の表の保有日数", HZ, index=HZ.index(NH), format_func=lambda v: f"購入後{v}日")
 rc = f"r{h}"
