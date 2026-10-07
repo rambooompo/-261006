@@ -1,6 +1,16 @@
 """共通部品：指標の計算・条件・入力画面・株価取得（app.py と pages/backtest.py から使う）"""
+import base64
+import json
+from pathlib import Path
+
+import numpy as np
 import pandas as pd
 import streamlit as st
+
+
+def _dv(key, **default):
+    """テンプレで値が入っている欄は既定値を渡さない（Streamlitの二重設定の警告を防ぐ）。"""
+    return {} if key in st.session_state else default
 
 SAMPLE = """7203,トヨタ自動車
 6758,ソニーグループ
@@ -197,20 +207,23 @@ def render_conditions(show_days=True, key_prefix=""):
                                 help="どのタイミングで買うか。過去検証ページでは、4つのきっかけを同じ条件で比べられます。")
         st.caption(TRIGGERS[p["trigger"]]["desc"])
         cols = st.columns(3 if show_days else 2)
-        p["short"] = int(cols[0].number_input("短期線（日）", 2, 50, 5, key=key_prefix + "short",
+        p["short"] = int(cols[0].number_input("短期線（日）", min_value=2, max_value=50, step=1, key=key_prefix + "short",
+                                              **_dv(key_prefix + "short", value=5),
                                               help="推奨: 5日。ゴールデンクロスで使います。"))
-        p["long"] = int(cols[1].number_input("長期線（日）", 5, 200, 25, key=key_prefix + "long",
+        p["long"] = int(cols[1].number_input("長期線（日）", min_value=5, max_value=200, step=1, key=key_prefix + "long",
+                                             **_dv(key_prefix + "long", value=25),
                                              help="推奨: 25日。ゴールデンクロスと押し目買いで使います。"))
         if show_days:
-            p["days"] = int(cols[2].number_input("直近N営業日以内", 1, 20, 1, key=key_prefix + "days",
+            p["days"] = int(cols[2].number_input("直近N営業日以内", min_value=1, max_value=20, step=1, key=key_prefix + "days",
+                                                 **_dv(key_prefix + "days", value=1),
                                                  help="推奨: 1〜3日。大きくすると、少し前のシグナルも拾います。"))
         c4, c5 = st.columns(2)
-        p["pb_pct"] = float(c4.number_input("押し目の深さ（長期線から◯%下）", 1.0, 20.0, 5.0, 0.5,
-                                            key=key_prefix + "pb_pct",
+        p["pb_pct"] = float(c4.number_input("押し目の深さ（長期線から◯%下）", min_value=1.0, max_value=20.0, step=0.5,
+                                            key=key_prefix + "pb_pct", **_dv(key_prefix + "pb_pct", value=5.0),
                                             help="押し目買いで使います。推奨: 5%前後。深いほど件数は減りますが、"
                                                  "反発が大きい傾向があるという検証があります。"))
-        p["rv_rsi"] = float(c5.number_input("逆張りのRSI(3)基準（◯以下）", 1.0, 50.0, 20.0, 1.0,
-                                            key=key_prefix + "rv_rsi",
+        p["rv_rsi"] = float(c5.number_input("逆張りのRSI(3)基準（◯以下）", min_value=1.0, max_value=50.0, step=1.0,
+                                            key=key_prefix + "rv_rsi", **_dv(key_prefix + "rv_rsi", value=20.0),
                                             help="短期逆張りで使います。推奨: 20前後（10〜20）。小さいほど強い売られすぎです。"))
         st.caption("推奨: 短期5日・長期25日・直近1〜3日・押し目5%・RSI(3)20以下。"
                    "きっかけを変えたら、③の絞り込み（特に出来高・乖離の条件）も見直してください。")
@@ -223,14 +236,15 @@ def render_conditions(show_days=True, key_prefix=""):
     for g in groups:
         with st.expander(g, expanded=False):
             for c in [c for c in CONDS if c["group"] == g]:
-                on = st.checkbox(f"{c['label']}〔{c['rec']}〕", value=c["on"], help=c["help"],
-                                 key=key_prefix + c["key"] + "_on")
+                on = st.checkbox(f"{c['label']}〔{c['rec']}〕", help=c["help"], key=key_prefix + c["key"] + "_on",
+                                 **_dv(key_prefix + c["key"] + "_on", value=c["on"]))
                 p[c["key"] + "_on"] = on
                 if "val" in c:
                     v = c["val"]
                     p[c["key"] + "_val"] = float(st.number_input(
-                        f"└ {v['label']}", float(v["min"]), float(v["max"]), float(v["default"]), float(v["step"]),
-                        disabled=not on, key=key_prefix + c["key"] + "_val"))
+                        f"└ {v['label']}", min_value=float(v["min"]), max_value=float(v["max"]), step=float(v["step"]),
+                        disabled=not on, key=key_prefix + c["key"] + "_val",
+                        **_dv(key_prefix + c["key"] + "_val", value=float(v["default"]))))
     return p
 
 
@@ -432,6 +446,7 @@ def fetch_chunk(codes: tuple, period: str):
         try:
             d = raw[t] if isinstance(raw.columns, pd.MultiIndex) else raw
             d = d.dropna(subset=["Close", "Open"])
+            d = d[~d.index.duplicated(keep="last")].sort_index()  # 同じ日付の重複行を除く
             if not d.empty:
                 out[c] = d
         except KeyError:
@@ -479,3 +494,110 @@ def fetch_market(period: str):
         except Exception:
             continue
     return None
+
+
+# ------------------------------------------------------------ テンプレ（条件の保存・読み込み）
+TEMPLATE_FILE = Path(__file__).with_name("templates.json")
+
+
+def template_keys():
+    keys = ["trigger", "short", "long", "days", "pb_pct", "rv_rsi", "universe"]
+    for c in CONDS:
+        keys.append(c["key"] + "_on")
+        if "val" in c:
+            keys.append(c["key"] + "_val")
+    return keys
+
+
+def _plain(v):
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    if isinstance(v, (float, np.floating)):
+        return float(v)
+    return v
+
+
+def make_template(name, settings, memo=""):
+    keys = set(template_keys())
+    return {"name": name, "memo": memo, "settings": {k: _plain(v) for k, v in settings.items() if k in keys}}
+
+
+def encode_template(t):
+    return base64.urlsafe_b64encode(json.dumps(t, ensure_ascii=False).encode("utf-8")).decode().rstrip("=")
+
+
+def decode_template(code):
+    return json.loads(base64.urlsafe_b64decode(code + "=" * (-len(code) % 4)).decode("utf-8"))
+
+
+def load_repo_templates():
+    """GitHubの templates.json に書かれたテンプレ（ずっと残る）。"""
+    try:
+        data = json.loads(TEMPLATE_FILE.read_text(encoding="utf-8"))
+        return [t for t in data if isinstance(t, dict) and "settings" in t]
+    except Exception:
+        return []
+
+
+def all_templates():
+    """templates.json のテンプレ ＋ このセッション中に保存したテンプレ。"""
+    out = {f"📁 {t.get('name', '名前なし')}": t for t in load_repo_templates()}
+    for name, t in st.session_state.get("templates", {}).items():
+        out[f"🕘 {name}"] = t
+    return out
+
+
+def apply_template(t, key_prefix=""):
+    """テンプレの値を画面の入力欄に入れる（ボタンの on_click から呼ぶ）。"""
+    keys = set(template_keys())
+    for c in CONDS:  # テンプレにない条件はOFFにする（前の設定が残らないように）
+        if c["key"] + "_on" not in t["settings"]:
+            st.session_state[key_prefix + c["key"] + "_on"] = False
+    for k, v in t["settings"].items():
+        if k in keys:
+            st.session_state[key_prefix + k] = v
+    st.session_state["_tpl_loaded"] = t.get("name", "")
+
+
+def save_session_template(t):
+    st.session_state.setdefault("templates", {})[t["name"]] = t
+
+
+def render_template_saver(t):
+    """テンプレの保存欄（過去検証・自動探索の結果の下に出す）。"""
+    code = encode_template(t)
+    st.markdown(f"**{t['name']}**  \n{t['memo']}")
+    st.button("このテンプレを保存（このセッション中だけ）", on_click=save_session_template, args=(t,),
+              key="_save_" + code[:24], width="stretch")
+    st.markdown(f"[🔗 シグナル検出をこの条件で開く](/?tpl={code})")
+    st.caption("このリンクをブックマークやホーム画面に追加すると、いつでもこの条件で開けます（ずっと使えます）。")
+    with st.expander("📁 テンプレ一覧ファイル（templates.json）に追加する文字", expanded=False):
+        st.code(json.dumps(t, ensure_ascii=False, indent=2), language="json")
+        st.caption("GitHubの templates.json を開き、[ ] の中にこの文字を貼り付けて保存すると、"
+                   "シグナル検出のテンプレ一覧にずっと残ります（2つ目以降は、前のテンプレとの間に「,」を入れてください）。")
+
+
+def render_template_loader(key_prefix=""):
+    """シグナル検出の画面の上に出す、テンプレの読み込み欄。"""
+    code = st.query_params.get("tpl")
+    if code and st.session_state.get("_tpl_code") != code:  # リンクから開いたとき（最初の1回だけ反映）
+        st.session_state["_tpl_code"] = code
+        try:
+            apply_template(decode_template(code), key_prefix)
+        except Exception:
+            st.warning("テンプレのリンクを読み込めませんでした。")
+    tpls = all_templates()
+    with st.expander("⭐ テンプレ（保存した条件）", expanded=not st.session_state.get("_tpl_loaded")):
+        if st.session_state.get("_tpl_loaded"):
+            st.success(f"テンプレ「{st.session_state['_tpl_loaded']}」の条件を読み込んでいます。")
+        if not tpls:
+            st.caption("まだテンプレがありません。過去検証・自動探索の結果の下にある「テンプレとして保存」から作れます。")
+            return
+        name = st.selectbox("テンプレ", list(tpls), key="_tpl_pick")
+        t = tpls[name]
+        if t.get("memo"):
+            st.caption(t["memo"])
+        st.button("この条件を読み込む", on_click=apply_template, args=(t, key_prefix), width="stretch")
+        st.caption("📁＝テンプレ一覧ファイル（ずっと残る）、🕘＝このセッション中に保存したもの（再読み込みで消えます）")
