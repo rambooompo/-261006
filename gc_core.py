@@ -541,9 +541,107 @@ def load_repo_templates():
         return []
 
 
+# --- クラウド保存（GitHubのGist）。Streamlitの Secrets に GITHUB_TOKEN があるときだけ使う
+GIST_FILE = "gc_templates.json"
+GH_API = "https://api.github.com"
+
+
+def _gh_token():
+    try:
+        return st.secrets.get("GITHUB_TOKEN") or None
+    except Exception:  # Secrets が未設定
+        return None
+
+
+def cloud_enabled():
+    return _gh_token() is not None
+
+
+def _gh(method, path, **kw):
+    import requests
+
+    res = requests.request(method, GH_API + path, timeout=20, **kw,
+                           headers={"Authorization": f"Bearer {_gh_token()}",
+                                    "Accept": "application/vnd.github+json"})
+    res.raise_for_status()
+    return res.json()
+
+
+def _find_gist():
+    """テンプレ保存用のGist（ファイル名 gc_templates.json）を探す。なければ None。"""
+    if st.session_state.get("_gist_id"):
+        return st.session_state["_gist_id"]
+    for page in range(1, 6):
+        gists = _gh("GET", f"/gists?per_page=100&page={page}")
+        for g in gists:
+            if GIST_FILE in g.get("files", {}):
+                st.session_state["_gist_id"] = g["id"]
+                return g["id"]
+        if len(gists) < 100:
+            break
+    return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _load_cloud(token_hint: str):  # 引数はキャッシュの区別用（トークンが変わったら読み直す）
+    gid = _find_gist()
+    if not gid:
+        return []
+    content = _gh("GET", f"/gists/{gid}")["files"][GIST_FILE]["content"]
+    data = json.loads(content or "[]")
+    return [t for t in data if isinstance(t, dict) and "settings" in t]
+
+
+def load_cloud_templates():
+    if not cloud_enabled():
+        return []
+    try:
+        return _load_cloud(_gh_token()[-6:])
+    except Exception as e:
+        st.session_state["_tpl_msg"] = ("error", f"クラウドのテンプレを読み込めませんでした（{type(e).__name__}）。")
+        return []
+
+
+def _write_cloud(templates):
+    body = {"files": {GIST_FILE: {"content": json.dumps(templates, ensure_ascii=False, indent=2)}}}
+    gid = _find_gist()
+    if gid:
+        _gh("PATCH", f"/gists/{gid}", json=body)
+    else:
+        g = _gh("POST", "/gists", json={"description": "株価アプリのテンプレ（自動作成）", "public": False, **body})
+        st.session_state["_gist_id"] = g["id"]
+    _load_cloud.clear()
+
+
+def save_cloud_template(t):
+    try:
+        cur = [x for x in load_cloud_templates() if x.get("name") != t["name"]]  # 同じ名前は上書き
+        _write_cloud(cur + [t])
+        st.session_state["_tpl_msg"] = ("success", f"「{t['name']}」を保存しました。再読み込みしても消えません。")
+    except Exception as e:
+        st.session_state["_tpl_msg"] = ("error", f"保存できませんでした（{type(e).__name__}）。"
+                                                 "GITHUB_TOKEN の設定を確認してください。")
+
+
+def delete_cloud_template(name):
+    try:
+        _write_cloud([x for x in load_cloud_templates() if x.get("name") != name])
+        st.session_state["_tpl_msg"] = ("success", f"「{name}」を削除しました。")
+        st.session_state.pop("_tpl_pick", None)
+    except Exception as e:
+        st.session_state["_tpl_msg"] = ("error", f"削除できませんでした（{type(e).__name__}）。")
+
+
+def _show_tpl_msg():
+    msg = st.session_state.pop("_tpl_msg", None)
+    if msg:
+        (st.success if msg[0] == "success" else st.error)(msg[1])
+
+
 def all_templates():
-    """templates.json のテンプレ ＋ このセッション中に保存したテンプレ。"""
-    out = {f"📁 {t.get('name', '名前なし')}": t for t in load_repo_templates()}
+    """☁️クラウド保存 ＋ 📁templates.json ＋ 🕘このセッション中だけ のテンプレ。"""
+    out = {f"☁️ {t.get('name', '名前なし')}": t for t in load_cloud_templates()}
+    out.update({f"📁 {t.get('name', '名前なし')}": t for t in load_repo_templates()})
     for name, t in st.session_state.get("templates", {}).items():
         out[f"🕘 {name}"] = t
     return out
@@ -563,20 +661,36 @@ def apply_template(t, key_prefix=""):
 
 def save_session_template(t):
     st.session_state.setdefault("templates", {})[t["name"]] = t
+    st.session_state["_tpl_msg"] = ("success", f"「{t['name']}」をこのセッションに保存しました（再読み込みで消えます）。")
+
+
+SETUP_HELP = (
+    "**テンプレをずっと残す設定（最初に1回だけ）**\n\n"
+    "1. GitHub で右上のアイコン →「Settings」→「Developer settings」→「Personal access tokens」→"
+    "「Tokens (classic)」→「Generate new token (classic)」を開く。\n"
+    "2. Note に「株価アプリ」、Expiration は「No expiration」、権限は **gist だけ** にチェックして作成し、"
+    "表示された文字（ghp_ で始まる）をコピー。\n"
+    "3. Streamlit のアプリ画面右下「Manage app」→「⋮」→「Settings」→「Secrets」に、次の1行を貼って保存：  \n"
+    "`GITHUB_TOKEN = \"ghp_ここにコピーした文字\"`\n\n"
+    "この文字は合言葉と同じなので、人に見せたりGitHubのファイルに書いたりしないでください。"
+)
 
 
 def render_template_saver(t):
-    """テンプレの保存欄（過去検証・自動探索の結果の下に出す）。"""
+    """テンプレの保存欄（過去検証・自動探索・目標勝率サーチの結果の下に出す）。"""
     code = encode_template(t)
+    _show_tpl_msg()
     st.markdown(f"**{t['name']}**  \n{t['memo']}")
-    st.button("このテンプレを保存（このセッション中だけ）", on_click=save_session_template, args=(t,),
-              key="_save_" + code[:24], width="stretch")
-    st.markdown(f"[🔗 シグナル検出をこの条件で開く](/?tpl={code})")
-    st.caption("このリンクをブックマークやホーム画面に追加すると、いつでもこの条件で開けます（ずっと使えます）。")
-    with st.expander("📁 テンプレ一覧ファイル（templates.json）に追加する文字", expanded=False):
-        st.code(json.dumps(t, ensure_ascii=False, indent=2), language="json")
-        st.caption("GitHubの templates.json を開き、[ ] の中にこの文字を貼り付けて保存すると、"
-                   "シグナル検出のテンプレ一覧にずっと残ります（2つ目以降は、前のテンプレとの間に「,」を入れてください）。")
+    if cloud_enabled():
+        st.button("☁️ このテンプレを保存（ずっと残る）", on_click=save_cloud_template, args=(t,),
+                  key="_save_" + code[:24], type="primary", width="stretch")
+    else:
+        st.button("🕘 このテンプレを保存（このセッション中だけ）", on_click=save_session_template, args=(t,),
+                  key="_save_" + code[:24], width="stretch")
+        with st.expander("再読み込みしても消えないようにするには", expanded=False):
+            st.markdown(SETUP_HELP)
+    st.markdown(f"[🔗 シグナル検出をこの条件で開く](/?embed=true&tpl={code})")
+    st.caption("このリンクをホーム画面に追加すると、その条件専用のアプリとしても使えます。")
 
 
 def render_template_loader(key_prefix=""):
@@ -589,15 +703,24 @@ def render_template_loader(key_prefix=""):
         except Exception:
             st.warning("テンプレのリンクを読み込めませんでした。")
     tpls = all_templates()
+    _show_tpl_msg()
     with st.expander("⭐ テンプレ（保存した条件）", expanded=not st.session_state.get("_tpl_loaded")):
         if st.session_state.get("_tpl_loaded"):
             st.success(f"テンプレ「{st.session_state['_tpl_loaded']}」の条件を読み込んでいます。")
         if not tpls:
-            st.caption("まだテンプレがありません。過去検証・自動探索の結果の下にある「テンプレとして保存」から作れます。")
+            st.caption("まだテンプレがありません。過去検証・自動探索・目標勝率サーチの結果の下から保存できます。")
+            if not cloud_enabled():
+                with st.expander("再読み込みしても消えないようにするには", expanded=False):
+                    st.markdown(SETUP_HELP)
             return
         name = st.selectbox("テンプレ", list(tpls), key="_tpl_pick")
         t = tpls[name]
         if t.get("memo"):
             st.caption(t["memo"])
-        st.button("この条件を読み込む", on_click=apply_template, args=(t, key_prefix), width="stretch")
-        st.caption("📁＝テンプレ一覧ファイル（ずっと残る）、🕘＝このセッション中に保存したもの（再読み込みで消えます）")
+        st.button("この条件を読み込む", on_click=apply_template, args=(t, key_prefix), type="primary", width="stretch")
+        if name.startswith("☁️"):
+            st.button("このテンプレを削除", on_click=delete_cloud_template, args=(t.get("name"),), width="stretch")
+        st.caption("☁️＝クラウドに保存（ずっと残る）、📁＝テンプレ一覧ファイル、🕘＝このセッション中だけ（再読み込みで消えます）")
+        if not cloud_enabled():
+            with st.expander("再読み込みしても消えないようにするには", expanded=False):
+                st.markdown(SETUP_HELP)
