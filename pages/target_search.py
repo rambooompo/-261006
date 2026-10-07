@@ -268,7 +268,8 @@ T = R["table"]
 st.subheader(f"3. 合格した条件（{len(T)} 通り）")
 if len(T) == 0:
     st.stop()
-show = T[[c for c in T.columns if not c.startswith("_")]].head(30)
+show = T[[c for c in T.columns if not c.startswith("_")]].head(30).copy()
+show.insert(0, "No.", range(1, len(show) + 1))  # 下の「保存する条件」の番号と同じ
 st.dataframe(show, hide_index=True, width="stretch")
 st.caption("後半の成績で並べています（件数が少ないものは割り引いて評価）。"
            "「4期間で目標以上」は、全期間を4つに分けたうち、目標の勝率を超えた期間の数です。4/4に近いほど安定しています。")
@@ -277,7 +278,7 @@ st.subheader("4. テンプレとして保存")
 if not reliable:
     st.warning("今回の結果は「偶然でも出る範囲」です。保存はできますが、使うときは注意してください。")
 _i = st.selectbox("保存する条件", list(range(min(len(T), 30))),
-                  format_func=lambda i: f"{i + 1}. {T.iloc[i]['きっかけ']}・{T.iloc[i]['保有']}：{T.iloc[i]['条件の組み合わせ']}",
+                  format_func=lambda i: f"No.{i + 1}  {T.iloc[i]['きっかけ']}・{T.iloc[i]['保有']}：{T.iloc[i]['条件の組み合わせ']}",
                   key="_tpl_pick_hunt")
 _row = T.iloc[_i]
 _settings = {"trigger": _row["_trig"], "short": R["short"], "long": R["long"], "pb_pct": R["pb_pct"],
@@ -286,8 +287,10 @@ for _k, _v in _row["_spec"]:
     _settings[_k + "_on"] = True
     if _v is not None:
         _settings[_k + "_val"] = float(_v)
-_name = st.text_input("テンプレの名前", value=f"{_row['きっかけ']}・{_row['保有']}：{_row['条件の組み合わせ']}"[:60],
-                      key="_tpl_name_hunt")
+# 選んだ条件ごとに入力欄を分けるので、条件を選び直すと名前も自動で切り替わる
+_name = st.text_input("テンプレの名前（自由に変更できます）",
+                      value=f"{_row['きっかけ']}・{_row['保有']}：{_row['条件の組み合わせ']}（勝率{_row['後半 勝率%']:.0f}%）"[:80],
+                      key=f"_tpl_name_hunt_{_i}")
 _memo = (f"{_row['きっかけ']}／購入後{_row['_h']}日・リターン{R['win_pct']:g}%以上で勝ち／目標勝率サーチの後半："
          f"件数{_row['後半 件数']}・勝率{_row['後半 勝率%']}%・平均{_row['後半 平均%']}%・4期間{_row['4期間で目標以上']}"
          f"（{pd.Timestamp.now():%Y-%m-%d}）")
