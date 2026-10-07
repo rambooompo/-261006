@@ -2,7 +2,7 @@
 import pandas as pd
 import streamlit as st
 
-from gc_core import render_universe, resolve_items, SAMPLE, compute, fetch_all, fetch_market, fetch_pbr, parse_tickers, render_conditions, signal
+from gc_core import render_template_loader, render_universe, resolve_items, SAMPLE, compute, fetch_all, fetch_market, fetch_pbr, parse_tickers, render_conditions, signal
 
 st.set_page_config(page_title="ゴールデンクロス検出", page_icon="📈", layout="centered")
 
@@ -10,6 +10,7 @@ st.title("📈 買いシグナル検出")
 st.caption("選んだ「買いのきっかけ」が出て、条件をすべて満たした銘柄を探します。株価はYahoo Finance（遅延・欠損あり）。"
            "きっかけ同士の比較や条件の効果は、左上メニューの「backtest」で過去検証できます。")
 
+render_template_loader()
 kind, text = render_universe()
 
 p = render_conditions(show_days=True)
@@ -46,9 +47,14 @@ if st.button("▶ スクリーニング開始", type="primary", width="stretch")
         st.warning("日経平均を取得できなかったため、「日経平均が75日線より上」の条件は外して判定しました。")
         p["market_on"] = False
 
-    rows = []
+    # 株価データの最新日をそろえる：多くの銘柄の最終日（＝最新の営業日）より古いデータの銘柄は判定しない
+    last_dates = pd.Series({c: df.index[-1] for c, df in data.items() if len(df)})
+    ref_date = last_dates.mode().max() if len(last_dates) else None
+    stale = sorted(c for c, d in last_dates.items() if d < ref_date)
+
+    rows, detail = [], {}
     for code, df in data.items():
-        if len(df) < p["long"] + p["days"] + 2:
+        if code in stale or len(df) < p["long"] + p["days"] + 2:
             continue
         x = compute(df, p["short"], p["long"], mkt, p["pb_pct"], p["rv_rsi"])
         sig = signal(x, p).iloc[-p["days"]:]
@@ -58,6 +64,7 @@ if st.button("▶ スクリーニング開始", type="primary", width="stretch")
         last = x.iloc[-1]
         rows.append({
             "コード": code, "銘柄名": names.get(code, ""), "シグナル日": d.strftime("%Y-%m-%d"),
+            "データ最終日": x.index[-1].strftime("%Y-%m-%d"),
             "終値": round(float(last["close"]), 1),
             "短期線": round(float(last["sma_s"]), 1), "長期線": round(float(last["sma_l"]), 1),
             "RSI": round(float(last["rsi_v"]), 1), "RSI(3)": round(float(last["rsi3_v"]), 1), "乖離率%": round(float(last["dev_v"]), 1),
@@ -68,7 +75,12 @@ if st.button("▶ スクリーニング開始", type="primary", width="stretch")
             "売買代金(百万円)": round(float(last["value_m"]), 1),
             "チャート": f"https://finance.yahoo.co.jp/quote/{code}.T/chart",
         })
+        t = x[["close", "sma_s", "sma_l"]].tail(10).round(1)
+        t.index = t.index.strftime("%Y-%m-%d")
+        t.columns = ["終値", f"{p['short']}日線", f"{p['long']}日線"]
+        detail[code] = t.iloc[::-1]
 
+    pbr_note = ""
     if pbr_on and rows:
         with st.spinner("PBRを取得中..."):
             for r in rows:
@@ -76,22 +88,43 @@ if st.button("▶ スクリーニング開始", type="primary", width="stretch")
         before = len(rows)
         rows = [r for r in rows if r["PBR"] is None or r["PBR"] <= pbr_max]
         unknown = sum(r["PBR"] is None for r in rows)
-        st.caption(f"PBR {pbr_max:g}倍以下で絞り込み：{before}銘柄 → {len(rows)}銘柄"
-                   + (f"（うちPBR不明 {unknown}銘柄）" if unknown else ""))
+        pbr_note = (f"PBR {pbr_max:g}倍以下で絞り込み：{before}銘柄 → {len(rows)}銘柄"
+                    + (f"（うちPBR不明 {unknown}銘柄）" if unknown else ""))
         for r in rows:
             r["PBR"] = f"{r['PBR']:.2f}" if r["PBR"] is not None else "不明"
 
-    miss = len(codes) - len(data)
-    note = f"（取得できなかった銘柄: {miss}）" if miss else ""
-    if not rows:
-        st.info(f"該当なし。対象 {len(codes)} 銘柄 {note}\n\n条件を減らすか、「直近N営業日以内」を増やすと見つかる場合があります。")
-    else:
+    res = None
+    if rows:
         res = pd.DataFrame(rows).sort_values("シグナル日", ascending=False)
         res = res[[c for c in res.columns if c != "チャート"] + ["チャート"]]  # チャートのリンクを右端に
-        st.success(f"該当 {len(res)} 銘柄 / 対象 {len(codes)} 銘柄 {note}")
+    st.session_state["scr"] = dict(res=res, detail=detail, n=len(codes), miss=len(codes) - len(data),
+                                   ref=ref_date, stale=stale, names=names, pbr_note=pbr_note)
+
+# ---- 結果の表示（確認用の選択を変えても結果が消えないよう、保存した結果から表示する）
+if "scr" in st.session_state:
+    R = st.session_state["scr"]
+    if R["ref"] is not None:
+        st.caption(f"株価データの最新日：{R['ref']:%Y-%m-%d}（証券アプリの日付と同じか確認してください）")
+    if R["stale"]:
+        st.warning(f"{len(R['stale'])}銘柄は株価データが最新日より古かったため、判定から外しました："
+                   + "、".join(R["stale"][:10]) + ("…" if len(R["stale"]) > 10 else ""))
+    if R["pbr_note"]:
+        st.caption(R["pbr_note"])
+    note = f"（取得できなかった銘柄: {R['miss']}）" if R["miss"] else ""
+    if R["res"] is None:
+        st.info(f"該当なし。対象 {R['n']} 銘柄 {note}\n\n条件を減らすか、「直近N営業日以内」を増やすと見つかる場合があります。")
+    else:
+        res = R["res"]
+        st.success(f"該当 {len(res)} 銘柄 / 対象 {R['n']} 銘柄 {note}")
         st.dataframe(res, hide_index=True, width="stretch",
                      column_config={"チャート": st.column_config.LinkColumn("チャート", display_text="開く")})
         st.download_button("CSVでダウンロード", res.drop(columns="チャート").to_csv(index=False).encode("utf-8-sig"),
-                           file_name="golden_cross.csv", mime="text/csv", width="stretch")
+                           file_name="signals.csv", mime="text/csv", width="stretch")
+        with st.expander("🔍 移動平均の確認（証券アプリと突き合わせ用）", expanded=False):
+            code = st.selectbox("銘柄", list(res["コード"]),
+                                format_func=lambda c: f"{c} {R['names'].get(c, '')}")
+            st.dataframe(R["detail"][code], width="stretch")
+            st.caption("このアプリが使っている株価（Yahoo Finance）での、直近10日の終値と移動平均です。"
+                       "証券アプリの値と大きく違う場合は、データの誤りの可能性があります。")
 
 st.caption("条件はシグナル日の時点で判定しています（過去検証と同じ基準）。投資判断の材料の一つです。利益を保証するものではありません。")
