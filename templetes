@@ -1,0 +1,15 @@
+[
+  {
+    "name": "例：ゴールデンクロス（初期設定）",
+    "memo": "アプリの初期設定と同じ条件です（見本）。",
+    "settings": {
+      "trigger": "gc", "short": 5, "long": 25, "days": 1,
+      "rising_on": true, "above75_on": true,
+      "vol_on": true, "vol_val": 1.5,
+      "value_on": true, "value_val": 100.0,
+      "rsi_on": true, "rsi_val": 70.0,
+      "dev_on": true, "dev_val": 10.0,
+      "market_on": true
+    }
+  }
+]
