@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from gc_core import render_universe, resolve_items, SAMPLE, TRIGGERS, compute, fetch_all, fetch_market, parse_tickers
+from gc_core import make_template, render_template_saver, render_universe, resolve_items, SAMPLE, TRIGGERS, compute, fetch_all, fetch_market, parse_tickers
 
 st.set_page_config(page_title="自動探索", page_icon="🧭", layout="centered")
 
@@ -51,11 +51,11 @@ def build_combos(pool, use_market, max_k):
     for key, label in BINARY:
         if key == "market" and not use_market:
             continue
-        atoms[key] = [(label, pool[key].to_numpy(bool))]
+        atoms[key] = [(label, pool[key].to_numpy(bool), (key, None))]
     for cid, col, fmt, op, vals in VALUED:
         arr = pool[col].to_numpy(float)
-        atoms[cid] = [(fmt.format(v), (arr >= v) if op == ">=" else (arr <= v)) for v in vals]
-    labels, masks, seen = [], [], set()
+        atoms[cid] = [(fmt.format(v), (arr >= v) if op == ">=" else (arr <= v), (cid, v)) for v in vals]
+    labels, masks, specs, seen = [], [], [], set()
     for k in range(1, max_k + 1):  # 条件の少ない順に作るので、同じ対象なら少ない条件のほうが残る
         for ks in combinations(list(atoms), k):
             for opt in product(*[atoms[a] for a in ks]):
@@ -68,7 +68,8 @@ def build_combos(pool, use_market, max_k):
                 seen.add(key)
                 labels.append(" ＋ ".join(o[0] for o in opt))
                 masks.append(m)
-    return labels, np.array(masks)
+                specs.append([o[2] for o in opt])
+    return labels, np.array(masks), specs
 
 
 def wilson_lb(p, n, z=1.96):
@@ -101,7 +102,7 @@ def search(pool, use_market, max_k, thr, objective, min_tr, min_te, n_perm, seed
     mid = pool.index.min() + (pool.index.max() - pool.index.min()) / 2
     tr = np.asarray(pool.index <= mid)
     te = ~tr
-    labels, masks = build_combos(pool, use_market, max_k)
+    labels, masks, specs = build_combos(pool, use_market, max_k)
     ret = pool["ret"].to_numpy(np.float32)
     Mtr, Mte = masks[:, tr].astype(np.float32), masks[:, te].astype(np.float32)
     rtr, rte = ret[tr], ret[te]
@@ -159,7 +160,7 @@ def search(pool, use_market, max_k, thr, objective, min_tr, min_te, n_perm, seed
         })
     p_val = float((np.sum(null >= obs) + 1) / (len(null) + 1)) if len(null) and np.isfinite(obs) else float("nan")
     return dict(table=pd.DataFrame(rows), base=base, n_combos=len(labels), n_rows=len(pool), obs=obs,
-                null=null, p=p_val, mid=mid, objective=objective, freq=freq)
+                null=null, p=p_val, mid=mid, objective=objective, freq=freq, specs=[specs[i] for i in idx])
 # ============================================================ 探索ロジック（ここまで）
 
 
@@ -216,7 +217,8 @@ if st.button("▶ 自動探索を実行", type="primary", width="stretch"):
         st.session_state["auto"] = search(pool, mkt is not None, max_k, win_pct / 100,
                                           "win" if objective_label.startswith("勝率") else "mean",
                                           min_tr, min_te, n_perm)
-        st.session_state["auto"].update(trig=TRIGGERS[trig]["label"], hold=hold, win_pct=win_pct, n_codes=len(data),
+        st.session_state["auto"].update(trig=TRIGGERS[trig]["label"], trig_key=trig, short=short, long=long_,
+                                        pb_pct=pb_pct, rv_rsi=rv_rsi, universe=kind, hold=hold, win_pct=win_pct, n_codes=len(data),
                                         mkt_ok=mkt is not None, t0=pool.index.min(), t1=pool.index.max())
 
 if "auto" not in st.session_state:
@@ -275,6 +277,24 @@ else:
     st.write(f"後半でも基準を上回ったのは **{len(good)} 件** です。スクリーニングの条件に入れて試す候補:")
     for _, r in good.head(3).iterrows():
         st.markdown(f"- **{r['条件の組み合わせ']}**（後半 {r['後半 件数']}件・勝率 {r['後半 勝率%']}%・4期間で基準超え {r['4期間で基準超え']}）")
+
+st.subheader("4. テンプレとして保存")
+st.caption("表の組み合わせを選んで、シグナル検出で使える形で保存します。選んだ条件以外の絞り込みはOFFになります。")
+if not reliable:
+    st.warning("今回の結果は「偶然でも出る範囲」です。保存はできますが、使うときは注意してください。")
+_i = st.selectbox("保存する組み合わせ", list(range(len(T))),
+                  format_func=lambda i: f"{i + 1}. {T.iloc[i]['条件の組み合わせ']}（{T.iloc[i]['判定']}）", key="_tpl_pick_auto")
+_row = T.iloc[_i]
+_settings = {"trigger": R["trig_key"], "short": R["short"], "long": R["long"], "pb_pct": R["pb_pct"],
+             "rv_rsi": R["rv_rsi"], "universe": R["universe"]}
+for _k, _v in R["specs"][_i]:
+    _settings[_k + "_on"] = True
+    if _v is not None:
+        _settings[_k + "_val"] = float(_v)
+_name = st.text_input("テンプレの名前", value=f"{R['trig']}：{_row['条件の組み合わせ']}"[:60], key="_tpl_name_auto")
+_memo = (f"{R['trig']}／購入後{R['hold']}日・リターン{R['win_pct']:g}%以上で勝ち／自動探索の後半：件数{_row['後半 件数']}・"
+         f"勝率{_row['後半 勝率%']}%・平均{_row['後半 平均%']}%・{_row['判定']}（{pd.Timestamp.now():%Y-%m-%d}）")
+render_template_saver(make_template(_name, _settings, _memo))
 
 st.info(
     "読み方の注意\n\n"
