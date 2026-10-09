@@ -5,8 +5,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from gc_core import (TRIGGERS, compute, fetch_all, fetch_market, make_template, render_template_saver,
-                     render_universe, resolve_items)
+from gc_core import (SEQ_WINDOWS, TRIGGERS, all_seq_keys, compute, date_codes, fetch_all, fetch_market,
+                     fetch_market_ohlc, fwd_returns, make_template, render_template_saver, render_universe,
+                     render_win_basis, resolve_items, shuffle_within_dates, trigger_label, trigger_series)
 
 st.set_page_config(page_title="目標勝率サーチ", page_icon="🎯", layout="centered")
 
@@ -28,8 +29,9 @@ VALUED = [  # (ID, 列名, 表示, 比較, 試す値)
 
 
 # ============================================================ 探索ロジック（ここから）
-def build_pools(data, mkt, short, long_, holds, cost, n_days, triggers, pb_pct, rv_rsi):
-    """きっかけごとに、シグナルが出た日（銘柄×日）の条件の値と、保有日数ごとのリターンを集める。"""
+def build_pools(data, mkt, short, long_, holds, cost, n_days, triggers, pb_pct, rv_rsi, mkt_px=None):
+    """きっかけごとに、シグナルが出た日（銘柄×日）の条件の値と、保有日数ごとのリターンを集める。
+    mkt_px（日経平均の始値・終値）を渡すと、リターンは「日経平均との差」になる。"""
     cols = [k for k, _ in BINARY] + sorted({c for _, c, *_ in VALUED})
     frames = {k: [] for k in triggers}
     base = {h: [] for h in holds}  # 毎日買った場合（目標の難しさを示す参考値）
@@ -38,14 +40,13 @@ def build_pools(data, mkt, short, long_, holds, cost, n_days, triggers, pb_pct, 
             continue
         x = compute(df, short, long_, mkt, pb_pct, rv_rsi)
         t = x[cols].copy()
-        entry = df["Open"].shift(-1)
-        for h in holds:
-            t[f"r{h}"] = df["Close"].shift(-(h + 1)) / entry - 1 - cost
+        for h, r in fwd_returns(df, holds, cost, 0, mkt_px).items():
+            t[f"r{h}"] = r
         t = t.iloc[-n_days:]
         for h in holds:
             base[h].append(t[f"r{h}"].dropna().to_numpy())
         for k in triggers:
-            frames[k].append(t[x["trig_" + k].iloc[-n_days:].to_numpy(bool)])
+            frames[k].append(t[trigger_series(x, k).iloc[-n_days:].to_numpy(bool)])
     pools = {k: pd.concat(v).sort_index() for k, v in frames.items() if v}
     base = {h: np.concatenate(v) if v else np.array([]) for h, v in base.items()}
     return pools, base
@@ -110,6 +111,7 @@ def hunt(pools, holds, target, thr, min_tr, min_te, max_k, use_market, n_perm, s
         tr = np.asarray(pool.index <= mid)
         labels, masks, specs = build_combos(pool, use_market, max_k)
         q = pd.qcut(pool.index.to_series().rank(method="first"), 4, labels=False).to_numpy()
+        dc = date_codes(pool.index)
         for h in holds:
             ret = pool[f"r{h}"].to_numpy(np.float32)
             A = Half(masks[:, tr].astype(np.float32), ret[tr])
@@ -124,7 +126,7 @@ def hunt(pools, holds, target, thr, min_tr, min_te, max_k, use_market, n_perm, s
             vb = B.valid.astype(bool)
             base_b = float(((B.ret0 >= thr)[vb]).mean()) if vb.any() else float("nan")
             groups.append(dict(trig=trig, h=h, A=A, B=B, elig=elig, n_rows=len(pool), base_b=base_b,
-                               pass_n=int(ok.sum())))
+                               pass_n=int(ok.sum()), dA=dc[tr], dB=dc[~tr]))
             allwin = (ret >= thr) & ~np.isnan(ret)
             for i, w2, m2, good in zip(cand, wr_b, mu_b, ok):
                 if not good:
@@ -133,7 +135,7 @@ def hunt(pools, holds, target, thr, min_tr, min_te, max_k, use_market, n_perm, s
                 beat = sum(1 for b in range(4)
                            if (sel := m & (q == b) & ~np.isnan(ret)).sum() >= 8 and allwin[sel].mean() >= target)
                 rows.append({
-                    "きっかけ": TRIGGERS[trig]["label"], "保有": f"{h}日", "条件の組み合わせ": labels[i],
+                    "きっかけ": trigger_label(trig), "保有": f"{h}日", "条件の組み合わせ": labels[i],
                     "前半 件数": int(A.n[i]), "前半 勝率%": round(float(wr_a[i]) * 100, 1),
                     "後半 件数": int(B.n[i]), "後半 勝率%": round(float(w2) * 100, 1),
                     "後半 平均%": round(float(m2) * 100, 2), "4期間で目標以上": f"{beat}/4",
@@ -142,7 +144,8 @@ def hunt(pools, holds, target, thr, min_tr, min_te, max_k, use_market, n_perm, s
                 })
     actual = sum(g["pass_n"] for g in groups)
 
-    # 偶然の目安：前半・後半それぞれの中で値動きを入れ替え、同じ手順で「合格」が何件出るか
+    # 偶然の目安：同じ日付のシグナルどうしの中だけで値動きを入れ替え（相場全体の動きは保つ）、
+    # 同じ手順で「合格」が何件出るかを数える
     null = []
     for _ in range(n_perm):
         cnt = 0
@@ -150,10 +153,10 @@ def hunt(pools, holds, target, thr, min_tr, min_te, max_k, use_market, n_perm, s
             A, B = g["A"], g["B"]
             a = A.ret0.copy()
             va = A.valid.astype(bool)
-            a[va] = rng.permutation(a[va])
+            a[va] = shuffle_within_dates(a[va], g["dA"][va], rng)
             b = B.ret0.copy()
             vb = B.valid.astype(bool)
-            b[vb] = rng.permutation(b[vb])
+            b[vb] = shuffle_within_dates(b[vb], g["dB"][vb], rng)
             wr_a, _ = A.stats(a, thr)
             cand = np.where(g["elig"] & (wr_a >= target))[0]
             if len(cand):
@@ -166,7 +169,7 @@ def hunt(pools, holds, target, thr, min_tr, min_te, max_k, use_market, n_perm, s
     table = pd.DataFrame(rows)
     if len(table):
         table = table.sort_values(["_score"], ascending=False).reset_index(drop=True)
-    base_tbl = pd.DataFrame([{"きっかけ": TRIGGERS[g["trig"]]["label"], "保有": f"{g['h']}日",
+    base_tbl = pd.DataFrame([{"きっかけ": trigger_label(g["trig"]), "保有": f"{g['h']}日",
                               "シグナル件数": g["n_rows"], "後半の勝率%（きっかけのみ）": round(g["base_b"] * 100, 1),
                               "合格した組み合わせ": g["pass_n"]} for g in groups])
     return dict(table=table, base_tbl=base_tbl, actual=actual, null=null, p=p,
@@ -184,12 +187,17 @@ with st.expander("② 目標と探す範囲", expanded=True):
     c1, c2 = st.columns(2)
     target_pct = c1.number_input("目標の勝率（%）", 50.0, 95.0, 65.0, 1.0,
                                  help="前半・後半の両方で、この勝率以上になる条件を探します。")
-    win_pct = c2.number_input("勝ちの基準（リターン◯%以上）", -20.0, 50.0, 0.0, 0.5,
+    win_pct = c2.number_input("勝ちの基準（◯%以上）", -20.0, 50.0, 0.0, 0.5,
                               help="推奨: 0%。下げると勝率は上がりますが、意味のある勝ちではなくなります。")
+    basis = render_win_basis("hunt_win_basis")
     holds = st.multiselect("保有日数（購入後◯営業日）の候補", [5, 10, 15, 20, 40], default=[10, 15, 20],
                            help="候補を増やすほど、偶然の合格も増えます。推奨: 3つ程度。")
     trigs = st.multiselect("買いのきっかけ", list(TRIGGERS), default=list(TRIGGERS),
                            format_func=lambda k: TRIGGERS[k]["label"])
+    use_seq = st.checkbox("2段階のきっかけ（Aのあと◯日以内にB）も探す", value=False,
+                          help="上で選んだきっかけ同士のすべての組み合わせ（A→B）も試します。時間がかかり、偶然の合格も増えます。")
+    seq_wins = st.multiselect("2段階の「◯日以内」", SEQ_WINDOWS, default=[10], disabled=not use_seq,
+                              format_func=lambda d: f"{d}営業日以内")
 
 with st.expander("③ 細かい設定", expanded=False):
     c3, c4 = st.columns(2)
@@ -220,10 +228,17 @@ if st.button("▶ 目標勝率サーチを実行", type="primary", width="stretc
         st.error(f"株価の取得に失敗しました: {e}")
         st.stop()
     mkt = fetch_market(period)
+    mkt_px = fetch_market_ohlc(period) if basis == "rel" else None
+    if basis == "rel" and mkt_px is None:
+        st.warning("日経平均を取得できなかったため、「リターンがプラスなら勝ち」で探します。")
+        basis = "abs"
+    all_trigs = list(trigs)
+    if use_seq and seq_wins:
+        all_trigs += [k for k in all_seq_keys(seq_wins) if k.split("|")[1] in trigs and k.split("|")[2] in trigs]
     with st.spinner("条件の組み合わせを試しています（1〜数分かかることがあります）..."):
-        pools, base = build_pools(data, mkt, short, long_, holds, cost, n_days, trigs, pb_pct, rv_rsi)
+        pools, base = build_pools(data, mkt, short, long_, holds, cost, n_days, all_trigs, pb_pct, rv_rsi, mkt_px)
         R = hunt(pools, holds, target_pct / 100, win_pct / 100, min_tr, min_te, max_k, mkt is not None, n_perm)
-    R.update(target=target_pct, win_pct=win_pct, n_codes=len(data), short=short, long=long_, pb_pct=pb_pct,
+    R.update(target=target_pct, win_pct=win_pct, basis=basis, n_codes=len(data), short=short, long=long_, pb_pct=pb_pct,
              rv_rsi=rv_rsi, universe=kind,
              base_daily={h: round(float((v >= win_pct / 100).mean()) * 100, 1) if len(v) else None
                          for h, v in base.items()})
@@ -236,6 +251,8 @@ R = st.session_state["hunt"]
 st.divider()
 st.write(f"対象 {R['n_codes']} 銘柄 / 試した組み合わせ **{R['n_combos']:,} 通り**"
          f"（きっかけ×保有日数×条件）/ 前半で勝率{R['target']:g}%以上：{R['n_cand']:,} 通り")
+if R.get("basis") == "rel":
+    st.info("勝ち負けと平均%は「日経平均との差」です（同じ期間の日経平均のリターンを差し引いた値）。")
 
 st.subheader("1. 結果のまとめ")
 null = R["null"]
@@ -291,7 +308,8 @@ for _k, _v in _row["_spec"]:
 _name = st.text_input("テンプレの名前（自由に変更できます）",
                       value=f"{_row['きっかけ']}・{_row['保有']}：{_row['条件の組み合わせ']}（勝率{_row['後半 勝率%']:.0f}%）"[:80],
                       key=f"_tpl_name_hunt_{_i}")
-_memo = (f"{_row['きっかけ']}／購入後{_row['_h']}日・リターン{R['win_pct']:g}%以上で勝ち／目標勝率サーチの後半："
+_memo = (f"{_row['きっかけ']}／購入後{_row['_h']}日・" + ("リターン" if R.get("basis", "abs") == "abs" else "日経平均との差")
+         + f"{R['win_pct']:g}%以上で勝ち／目標勝率サーチの後半："
          f"件数{_row['後半 件数']}・勝率{_row['後半 勝率%']}%・平均{_row['後半 平均%']}%・4期間{_row['4期間で目標以上']}"
          f"（{pd.Timestamp.now():%Y-%m-%d}）")
 render_template_saver(make_template(_name, _settings, _memo))
