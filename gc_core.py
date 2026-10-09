@@ -143,6 +143,73 @@ TRIGGERS = {
                                             "売られた最初の日。上昇中の短い売られすぎを拾います。"),
 }
 
+SEQ_WINDOWS = [5, 10, 20]
+
+
+def is_seq(key):
+    return str(key).startswith("seq|")
+
+
+def parse_seq(key):
+    _, a, b, w = str(key).split("|")
+    return a, b, int(w)
+
+
+def seq_key(a, b, w):
+    return f"seq|{a}|{b}|{int(w)}"
+
+
+def all_seq_keys(windows=SEQ_WINDOWS):
+    return [seq_key(a, b, w) for a in TRIGGERS for b in TRIGGERS for w in windows]
+
+
+def trigger_label(key):
+    if is_seq(key):
+        a, b, w = parse_seq(key)
+        return f"{TRIGGERS[a]['label']}→{TRIGGERS[b]['label']}（{w}日以内）"
+    return TRIGGERS[key]["label"]
+
+
+def trigger_desc(key):
+    if is_seq(key):
+        a, b, w = parse_seq(key)
+        return (f"「{TRIGGERS[a]['label']}」が出てから{w}営業日以内に「{TRIGGERS[b]['label']}」が出た日。"
+                f"（B：{TRIGGERS[b]['desc']}）")
+    return TRIGGERS[key]["desc"]
+
+
+def trigger_series(x, key):
+    """きっかけのシグナル（True/False）。2段階は「Bの日で、その前のw営業日以内にAが出ている」。"""
+    if not is_seq(key):
+        return x["trig_" + key]
+    a, b, w = parse_seq(key)
+    prior = x["trig_" + a].astype(float).shift(1).rolling(w, min_periods=1).max().fillna(0).astype(bool)
+    return x["trig_" + b] & prior
+
+
+def trigger_picker(key_prefix=""):
+    """きっかけの選択欄（1段階／2段階）。選んだきっかけのキーを返す。"""
+    mode = st.radio("きっかけの種類", ["single", "seq"], horizontal=True, key=key_prefix + "trig_mode",
+                    format_func=lambda m: {"single": "1段階", "seq": "2段階（Aのあと◯日以内にB）"}[m],
+                    help="2段階：先にAが出て、そのあと決めた日数以内にBが出た日を買いのきっかけにします。"
+                         "例：52週高値ブレイク→押し目買い（高値更新のあとの最初の押し目）。")
+    if mode == "single":
+        key = st.radio("きっかけ", list(TRIGGERS), format_func=lambda k: TRIGGERS[k]["label"],
+                       key=key_prefix + "trigger",
+                       help="どのタイミングで買うか。過去検証ページでは、4つのきっかけを同じ条件で比べられます。")
+    else:
+        c1, c2, c3 = st.columns(3)
+        a = c1.selectbox("先に出る A", list(TRIGGERS), format_func=lambda k: TRIGGERS[k]["label"],
+                         key=key_prefix + "seq_first")
+        b = c2.selectbox("買う日の B", list(TRIGGERS), format_func=lambda k: TRIGGERS[k]["label"],
+                         key=key_prefix + "seq_second", **_dv(key_prefix + "seq_second", index=1))
+        w = c3.selectbox("A から", SEQ_WINDOWS, format_func=lambda d: f"{d}営業日以内",
+                         key=key_prefix + "seq_win", **_dv(key_prefix + "seq_win", index=1))
+        key = seq_key(a, b, w)
+    st.caption(trigger_desc(key))
+    return key
+
+
 # ------------------------------------------------------------ 条件の定義
 # rec = 画面に出す推奨値（一般的な目安）。help = 「?」を押すと出る説明。
 CONDS = [
@@ -202,10 +269,7 @@ def render_conditions(show_days=True, key_prefix=""):
     """条件の入力画面を出して、設定値の辞書を返す。"""
     p = {}
     with st.expander("② 買いのきっかけ", expanded=True):
-        p["trigger"] = st.radio("きっかけ", list(TRIGGERS), format_func=lambda k: TRIGGERS[k]["label"],
-                                key=key_prefix + "trigger",
-                                help="どのタイミングで買うか。過去検証ページでは、4つのきっかけを同じ条件で比べられます。")
-        st.caption(TRIGGERS[p["trigger"]]["desc"])
+        p["trigger"] = trigger_picker(key_prefix)
         cols = st.columns(3 if show_days else 2)
         p["short"] = int(cols[0].number_input("短期線（日）", min_value=2, max_value=50, step=1, key=key_prefix + "short",
                                               **_dv(key_prefix + "short", value=5),
@@ -322,7 +386,7 @@ def masks(x, p):
 
 def signal(x, p, m=None):
     m = m or masks(x, p)
-    sig = x["trig_" + p.get("trigger", "gc")].copy()
+    sig = trigger_series(x, p.get("trigger", "gc")).copy()
     for c in CONDS:
         if p.get(c["key"] + "_on"):
             sig &= m[c["key"]]
@@ -479,8 +543,8 @@ def fetch_pbr(code: str):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_market(period: str):
-    """日経平均が75日線より上か（True/False の列）。取れなければ日経225連動ETF(1321)で代用。"""
+def fetch_market_ohlc(period: str):
+    """日経平均の始値・終値（DataFrame: Open, Close）。取れなければ日経225連動ETF(1321)で代用。"""
     import yfinance as yf
 
     for t in ("^N225", "1321.T"):
@@ -488,12 +552,23 @@ def fetch_market(period: str):
             d = yf.download(t, period=period, interval="1d", auto_adjust=True, progress=False)
             if isinstance(d.columns, pd.MultiIndex):
                 d = d.droplevel(1, axis=1) if "Close" in d.columns.get_level_values(0) else d[t]
-            c = d["Close"].dropna()
-            if len(c) > 100:
-                return c > c.rolling(75).mean()
+            d = d[["Open", "Close"]].dropna()
+            d = d[~d.index.duplicated(keep="last")].sort_index()
+            if len(d) > 100:
+                return d
         except Exception:
             continue
     return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_market(period: str):
+    """日経平均が75日線より上か（True/False の列）。"""
+    d = fetch_market_ohlc(period)
+    if d is None:
+        return None
+    c = d["Close"]
+    return c > c.rolling(75).mean()
 
 
 # ------------------------------------------------------------ テンプレ（条件の保存・読み込み）
@@ -654,8 +729,16 @@ def apply_template(t, key_prefix=""):
         if c["key"] + "_on" not in t["settings"]:
             st.session_state[key_prefix + c["key"] + "_on"] = False
     for k, v in t["settings"].items():
-        if k in keys:
+        if k in keys and k != "trigger":
             st.session_state[key_prefix + k] = v
+    trig = t["settings"].get("trigger")
+    if trig:
+        if is_seq(trig):
+            a, b, w = parse_seq(trig)
+            st.session_state.update({key_prefix + "trig_mode": "seq", key_prefix + "seq_first": a,
+                                     key_prefix + "seq_second": b, key_prefix + "seq_win": w})
+        else:
+            st.session_state.update({key_prefix + "trig_mode": "single", key_prefix + "trigger": trig})
     st.session_state["_tpl_loaded"] = t.get("name", "")
 
 
@@ -724,3 +807,61 @@ def render_template_loader(key_prefix=""):
         if not cloud_enabled():
             with st.expander("再読み込みしても消えないようにするには", expanded=False):
                 st.markdown(SETUP_HELP)
+
+
+# ------------------------------------------------------------ 検証用の共通部品
+WIN_BASES = {"abs": "リターンがプラスなら勝ち（◯%以上）", "rel": "日経平均に勝ったら勝ち（差が◯%以上）"}
+
+
+def render_win_basis(key="win_basis"):
+    """勝ちの基準の選択欄。'abs' か 'rel' を返す。"""
+    return st.radio("勝ちの判定", list(WIN_BASES), format_func=lambda k: WIN_BASES[k], key=key,
+                    help="「日経平均に勝ったら勝ち」は、同じ期間の日経平均のリターンを差し引いて判定します。"
+                         "上昇相場では何を買っても勝ちやすいので、条件そのものの力を見るならこちらがおすすめです。")
+
+
+def fwd_returns(df, holds, cost, delay=0, mkt=None):
+    """保有日数ごとのリターン（dict: h -> Series）。
+    買い＝シグナル翌営業日から delay 日後の始値、売り＝買った日から h 営業日後の終値（売買コストを差し引く）。
+    mkt（日経平均の Open/Close）を渡すと、同じ期間の日経平均のリターンを差し引いた「相場との差」にする。"""
+    entry = df["Open"].shift(-(1 + delay))
+    out = {}
+    if mkt is not None:
+        mo = mkt["Open"].reindex(df.index)
+        mc = mkt["Close"].reindex(df.index)
+        m_entry = mo.shift(-(1 + delay))
+    for h in holds:
+        r = df["Close"].shift(-(1 + delay + h)) / entry - 1 - cost
+        if mkt is not None:
+            r = r - (mc.shift(-(1 + delay + h)) / m_entry - 1)
+        out[h] = r
+    return out
+
+
+def date_codes(index):
+    """日付ごとの番号（同じ日の行は同じ番号）。"""
+    return pd.DatetimeIndex(index).normalize().asi8
+
+
+def shuffle_within_dates(values, codes, rng):
+    """同じ日付の行どうしの中だけで値を入れ替える（相場全体の動きは保ったまま、銘柄ごとの差だけを崩す）。"""
+    values = np.asarray(values)
+    codes = np.asarray(codes)
+    order = np.argsort(codes, kind="stable")
+    shuf = np.lexsort((rng.random(len(values)), codes))
+    out = np.empty_like(values)
+    out[order] = values[shuf]
+    return out
+
+
+def clustered_se(r, index):
+    """平均の標準誤差（同じ月の取引どうしは連動しやすいので、月ごとのまとまりを考慮する）。"""
+    r = pd.Series(np.asarray(r, dtype=float), index=pd.DatetimeIndex(index)).dropna()
+    n = len(r)
+    if n < 2:
+        return float("nan")
+    e = r - r.mean()
+    s = e.groupby(e.index.to_period("M")).sum().to_numpy()
+    if len(s) < 2:
+        return float(r.std() / np.sqrt(n))
+    return float(np.sqrt((s ** 2).sum() * len(s) / (len(s) - 1)) / n)
