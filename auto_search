@@ -5,7 +5,9 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from gc_core import make_template, render_template_saver, render_universe, resolve_items, SAMPLE, TRIGGERS, compute, fetch_all, fetch_market, parse_tickers
+from gc_core import (compute, date_codes, fetch_all, fetch_market, fetch_market_ohlc, fwd_returns, make_template,
+                     render_template_saver, render_universe, render_win_basis, resolve_items, shuffle_within_dates,
+                     trigger_label, trigger_picker, trigger_series)
 
 st.set_page_config(page_title="自動探索", page_icon="🧭", layout="centered")
 
@@ -28,19 +30,21 @@ TOP = 10
 
 
 # ============================================================ 探索ロジック（ここから）
-def build_pool(data, mkt, short, long_, hold, cost, n_days, trig="gc", pb_pct=5.0, rv_rsi=20.0):
-    """きっかけが出た日（銘柄×日）だけを集め、条件の判定値と購入後リターンを付ける。"""
-    cols = ["trig_" + trig] + [k for k, _ in BINARY] + sorted({c for _, c, *_ in VALUED})
+def build_pool(data, mkt, short, long_, hold, cost, n_days, trig="gc", pb_pct=5.0, rv_rsi=20.0, mkt_px=None):
+    """きっかけが出た日（銘柄×日）だけを集め、条件の判定値と購入後リターンを付ける。
+    mkt_px（日経平均の始値・終値）を渡すと、リターンは「日経平均との差」になる。"""
+    cols = [k for k, _ in BINARY] + sorted({c for _, c, *_ in VALUED})
     frames = []
     for code, df in data.items():
         if len(df) < 260:
             continue
         x = compute(df, short, long_, mkt, pb_pct, rv_rsi)
         t = x[cols].copy()
-        t["ret"] = df["Close"].shift(-(hold + 1)) / df["Open"].shift(-1) - 1 - cost
+        t["_trig"] = trigger_series(x, trig)
+        t["ret"] = fwd_returns(df, [hold], cost, 0, mkt_px)[hold]
         t["code"] = code
         t = t.iloc[-n_days:]
-        frames.append(t[t["trig_" + trig] & t["ret"].notna()])
+        frames.append(t[t["_trig"] & t["ret"].notna()].drop(columns="_trig"))
     if not frames:
         return None
     return pd.concat(frames).sort_index()
@@ -106,6 +110,8 @@ def search(pool, use_market, max_k, thr, objective, min_tr, min_te, n_perm, seed
     ret = pool["ret"].to_numpy(np.float32)
     Mtr, Mte = masks[:, tr].astype(np.float32), masks[:, te].astype(np.float32)
     rtr, rte = ret[tr], ret[te]
+    dc = date_codes(pool.index)
+    dtr, dte = dc[tr], dc[te]
     wtr, wte = (rtr >= thr).astype(np.float32), (rte >= thr).astype(np.float32)
 
     n_tr, wr_tr, mu_tr, var_tr = group_stats(Mtr, rtr, wtr)
@@ -123,11 +129,12 @@ def search(pool, use_market, max_k, thr, objective, min_tr, min_te, n_perm, seed
     gain = lambda w, m: (w - base["wr_te"]) * 100 if objective == "win" else (m - base["mu_te"]) * 100
     obs = float(np.mean(gain(wr_te[idx], mu_te[idx]))) if len(idx) else float("nan")
 
-    # 偶然の目安：前半・後半それぞれの中で値動きをシャッフルし、同じ手順で「選んで確かめる」
+    # 偶然の目安：同じ日付のシグナルどうしの中だけで値動きを入れ替え（相場全体の動きは保つ）、
+    # 同じ手順で「選んで確かめる」。1件ずつ入れ替えると、相場に連動する分だけ偶然の幅を小さく見積もってしまう。
     rng = np.random.default_rng(seed)
     null = []
     for _ in range(n_perm):
-        a, b = rng.permutation(rtr), rng.permutation(rte)
+        a, b = shuffle_within_dates(rtr, dtr, rng), shuffle_within_dates(rte, dte, rng)
         wa, wb = (a >= thr).astype(np.float32), (b >= thr).astype(np.float32)
         s_n, s_w, s_m, s_v = group_stats(Mtr, a, wa)
         j = pick(score_of(objective, s_n, s_w, s_m, s_v), n_tr, n_te, min_tr, min_te)
@@ -171,9 +178,8 @@ st.caption("条件の組み合わせを自動でたくさん試し、勝率の�
 kind, text = render_universe()
 
 with st.expander("② 売買の条件", expanded=True):
-    trig = st.radio("買いのきっかけ", list(TRIGGERS), format_func=lambda k: TRIGGERS[k]["label"],
-                    help="このきっかけが出た日を土台にして、条件の組み合わせを探します。")
-    st.caption(TRIGGERS[trig]["desc"])
+    trig = trigger_picker("auto_")
+    basis = render_win_basis("auto_win_basis")
     ca, cb = st.columns(2)
     pb_pct = float(ca.number_input("押し目の深さ（%）", 1.0, 20.0, 5.0, 0.5, help="押し目買いで使います。推奨: 5%前後。"))
     rv_rsi = float(cb.number_input("逆張りのRSI(3)基準", 1.0, 50.0, 20.0, 1.0, help="短期逆張りで使います。推奨: 20前後。"))
@@ -182,7 +188,8 @@ with st.expander("② 売買の条件", expanded=True):
     long_ = int(c2.number_input("長期線（日）", 5, 200, 25))
     hold = int(c3.number_input("保有日数（購入後）", 1, 250, 15, help="購入日から数えて何営業日後に売るか。推奨: 15日。"))
     c4, c5, c6 = st.columns(3)
-    win_pct = c4.number_input("勝ちの基準（%以上）", -20.0, 50.0, 0.0, 0.5, help="コスト引き後のリターンがこの値以上なら勝ち。推奨: 0%。")
+    win_pct = c4.number_input("勝ちの基準（%以上）", -20.0, 50.0, 0.0, 0.5,
+                              help="コスト引き後のリターン（または日経平均との差）がこの値以上なら勝ち。推奨: 0%。")
     n_days = int(c5.number_input("検証期間（営業日）", 250, 1500, 1000, 50, help="推奨: 1000日。"))
     cost = c6.number_input("売買コスト（往復%）", 0.0, 3.0, 0.2, 0.1, help="推奨: 0.2%前後。") / 100
 
@@ -209,7 +216,11 @@ if st.button("▶ 自動探索を実行", type="primary", width="stretch"):
         st.error(f"株価の取得に失敗しました: {e}")
         st.stop()
     mkt = fetch_market(period)
-    pool = build_pool(data, mkt, short, long_, hold, cost, n_days, trig, pb_pct, rv_rsi)
+    mkt_px = fetch_market_ohlc(period) if basis == "rel" else None
+    if basis == "rel" and mkt_px is None:
+        st.warning("日経平均を取得できなかったため、「リターンがプラスなら勝ち」で探します。")
+        basis = "abs"
+    pool = build_pool(data, mkt, short, long_, hold, cost, n_days, trig, pb_pct, rv_rsi, mkt_px)
     if pool is None or len(pool) < 100:
         st.error("検証できるシグナルの件数が少なすぎます（銘柄を増やすか、検証期間を長くしてください）。")
         st.stop()
@@ -217,7 +228,7 @@ if st.button("▶ 自動探索を実行", type="primary", width="stretch"):
         st.session_state["auto"] = search(pool, mkt is not None, max_k, win_pct / 100,
                                           "win" if objective_label.startswith("勝率") else "mean",
                                           min_tr, min_te, n_perm)
-        st.session_state["auto"].update(trig=TRIGGERS[trig]["label"], trig_key=trig, short=short, long=long_,
+        st.session_state["auto"].update(trig=trigger_label(trig), trig_key=trig, basis=basis, short=short, long=long_,
                                         pb_pct=pb_pct, rv_rsi=rv_rsi, universe=kind, hold=hold, win_pct=win_pct, n_codes=len(data),
                                         mkt_ok=mkt is not None, t0=pool.index.min(), t1=pool.index.max())
 
@@ -233,7 +244,8 @@ if not R["mkt_ok"]:
     st.caption("※日経平均を取得できなかったため、地合いの条件は使っていません。")
 st.write(f"基準（きっかけだけで買った場合）: 前半の勝率 **{B['wr_tr'] * 100:.1f}%**（{B['n_tr']}件）／"
          f"後半の勝率 **{B['wr_te'] * 100:.1f}%**（{B['n_te']}件）。"
-         f"勝ち＝購入後{R['hold']}営業日でリターン{R['win_pct']:g}%以上。")
+         f"勝ち＝購入後{R['hold']}営業日で" + ("リターン" if R.get("basis", "abs") == "abs" else "日経平均との差")
+         + f"{R['win_pct']:g}%以上。")
 
 st.subheader("1. 前半で選んだ上位の条件を、後半で確かめた結果")
 T = R["table"]
@@ -295,7 +307,8 @@ for _k, _v in R["specs"][_i]:
         _settings[_k + "_val"] = float(_v)
 _name = st.text_input("テンプレの名前（自由に変更できます）", value=f"{R['trig']}：{_row['条件の組み合わせ']}"[:80],
                       key=f"_tpl_name_auto_{_i}")  # 組み合わせを選び直すと名前も切り替わる
-_memo = (f"{R['trig']}／購入後{R['hold']}日・リターン{R['win_pct']:g}%以上で勝ち／自動探索の後半：件数{_row['後半 件数']}・"
+_memo = (f"{R['trig']}／購入後{R['hold']}日・" + ("リターン" if R.get("basis", "abs") == "abs" else "日経平均との差")
+         + f"{R['win_pct']:g}%以上で勝ち／自動探索の後半：件数{_row['後半 件数']}・"
          f"勝率{_row['後半 勝率%']}%・平均{_row['後半 平均%']}%・{_row['判定']}（{pd.Timestamp.now():%Y-%m-%d}）")
 render_template_saver(make_template(_name, _settings, _memo))
 
