@@ -1,0 +1,204 @@
+"""タイミング分析：シグナルのあと「何日待って買い」「何日持って売る」と成績がよいかを調べる"""
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from gc_core import (clustered_se, compute, fetch_all, fetch_market, fetch_market_ohlc, render_conditions,
+                     render_universe, render_win_basis, resolve_items, signal, trigger_label)
+
+st.set_page_config(page_title="タイミング分析", page_icon="⏱", layout="centered")
+
+
+# ============================================================ 計算（ここから）
+def timing_matrix(df, sig, n_days, max_delay, max_hold, cost, mkt_px=None):
+    """シグナルごとに「d日待って買い（d=0は翌営業日の始値）、買ってからh営業日後の終値で売る」リターンを計算。
+    戻り値：(リターン配列 [シグナル数 × 待つ日数 × 保有日数], シグナル日の配列)"""
+    n = len(df)
+    pos = np.where(sig.to_numpy(bool))[0]
+    pos = pos[pos >= n - n_days]
+    if len(pos) == 0:
+        return None, None
+    O = df["Open"].to_numpy(float)
+    C = df["Close"].to_numpy(float)
+    D = np.arange(max_delay + 1)
+    H = np.arange(1, max_hold + 1)
+    e = pos[:, None] + 1 + D[None, :]                    # 買う日
+    x = e[:, :, None] + H[None, None, :]                 # 売る日
+    ok = (x < n) & (e[:, :, None] < n)
+    ec, xc = np.minimum(e, n - 1), np.minimum(x, n - 1)
+    r = C[xc] / O[ec][:, :, None] - 1 - cost
+    if mkt_px is not None:
+        mo = mkt_px["Open"].reindex(df.index).to_numpy(float)
+        mc = mkt_px["Close"].reindex(df.index).to_numpy(float)
+        r = r - (mc[xc] / mo[ec][:, :, None] - 1)
+    r[~ok] = np.nan
+    return r.astype(np.float32), df.index[pos].to_numpy()
+
+
+def curve(R, dates, d, thr, mid):
+    """待つ日数 d のときの、保有日数ごとの 件数・勝率・平均（全体・前半・後半）。"""
+    out = []
+    first = dates <= mid
+    for j in range(R.shape[2]):
+        v = R[:, d, j]
+        ok = ~np.isnan(v)
+        row = {"保有日数": j + 1, "件数": int(ok.sum())}
+        for name, sel in [("全体", ok), ("前半", ok & first), ("後半", ok & ~first)]:
+            vv = v[sel]
+            row[f"{name}勝率%"] = float((vv >= thr).mean() * 100) if len(vv) else np.nan
+            row[f"{name}平均%"] = float(vv.mean() * 100) if len(vv) else np.nan
+        out.append(row)
+    return pd.DataFrame(out).set_index("保有日数")
+
+
+def peak(series, smooth=5):
+    """なだらかにしたうえで一番高い位置（細かいギザギザに引っ張られないように）。"""
+    s = series.rolling(smooth, center=True, min_periods=1).mean()
+    return int(s.idxmax()) if s.notna().any() else None
+# ============================================================ 計算（ここまで）
+
+
+st.title("⏱ タイミング分析")
+st.caption("シグナルが出たあと、「何日待って買い」「何日持って売る」と成績がよいかを調べます。"
+           "前半・後半で別々に計算し、両方で同じあたりがよければ、目安として使える可能性が高まります。")
+
+kind, text = render_universe("tm_")
+p = render_conditions(show_days=False, key_prefix="tm_")
+with st.expander("④ 勝ちの判定・調べる範囲", expanded=True):
+    basis = render_win_basis("tm_win_basis")
+    c1, c2 = st.columns(2)
+    win_pct = c1.number_input("勝ちの基準（◯%以上）", -20.0, 50.0, 0.0, 0.5, help="推奨: 0%。")
+    cost = c2.number_input("売買コスト（往復%）", 0.0, 3.0, 0.2, 0.1, help="推奨: 0.2%前後。") / 100
+    c3, c4, c5 = st.columns(3)
+    max_hold = int(c3.number_input("保有日数の最大", 5, 120, 60, 5, help="1日〜この日数まで、1日ずつ調べます。推奨: 60日。"))
+    max_delay = int(c4.number_input("待つ日数の最大", 0, 20, 10, 1,
+                                    help="シグナルの翌営業日から、最大何日待って買うかを調べます。推奨: 10日。"))
+    n_days = int(c5.number_input("検証期間（営業日）", 250, 1500, 1000, 50, help="推奨: 1000日。"))
+
+if st.button("▶ タイミング分析を実行", type="primary", width="stretch"):
+    items = resolve_items(kind, text)
+    if not items or p["short"] >= p["long"]:
+        st.warning("銘柄を入力し、短期線は長期線より小さくしてください。")
+        st.stop()
+    codes = [c for c, _ in items]
+    period = f"{min(int(np.ceil((n_days + max_hold + max_delay) / 245)) + 2, 10)}y"
+    try:
+        data = fetch_all(codes, period)
+    except Exception as e:
+        st.error(f"株価の取得に失敗しました: {e}")
+        st.stop()
+    mkt = fetch_market(period)
+    if mkt is None:
+        p["market_on"] = False
+    mkt_px = fetch_market_ohlc(period) if basis == "rel" else None
+    if basis == "rel" and mkt_px is None:
+        st.warning("日経平均を取得できなかったため、「リターンがプラスなら勝ち」で調べます。")
+        basis = "abs"
+    Rs, Ds = [], []
+    with st.spinner("計算しています..."):
+        for code, df in data.items():
+            if len(df) < 260:
+                continue
+            x = compute(df, p["short"], p["long"], mkt, p["pb_pct"], p["rv_rsi"])
+            r, d = timing_matrix(df, signal(x, p), n_days, max_delay, max_hold, cost, mkt_px)
+            if r is not None:
+                Rs.append(r)
+                Ds.append(d)
+    if not Rs:
+        st.error("この条件ではシグナルがありませんでした。条件を減らしてみてください。")
+        st.stop()
+    dates = np.concatenate(Ds)
+    st.session_state["timing"] = dict(R=np.concatenate(Rs), dates=pd.DatetimeIndex(dates), basis=basis,
+                                      thr=win_pct / 100, trig=trigger_label(p["trigger"]), n_codes=len(data),
+                                      max_hold=max_hold, max_delay=max_delay)
+
+if "timing" not in st.session_state:
+    st.stop()
+
+T = st.session_state["timing"]
+R, dates, thr = T["R"], T["dates"], T["thr"]
+mid = dates.min() + (dates.max() - dates.min()) / 2
+dn = dates.to_numpy()
+st.divider()
+st.write(f"きっかけ「{T['trig']}」／ 対象 {T['n_codes']} 銘柄 ／ シグナル **{len(R)} 件** "
+         f"（{dates.min():%Y-%m-%d} 〜 {dates.max():%Y-%m-%d}、前半・後半の境目 {mid:%Y-%m-%d}）")
+if T["basis"] == "rel":
+    st.info("勝ち負けと平均%は「日経平均との差」です（同じ期間の日経平均のリターンを差し引いた値）。")
+
+# ---- 1. 何日持って売るか
+st.subheader("1. 何日持って売るか（翌営業日に買った場合）")
+cv = curve(R, dn, 0, thr, np.datetime64(mid))
+st.markdown("**勝率%**（保有日数ごと）")
+st.line_chart(cv[["全体勝率%", "前半勝率%", "後半勝率%"]], x_label="保有日数（購入後の営業日）", y_label="勝率%")
+st.markdown("**平均リターン%**（保有日数ごと）")
+st.line_chart(cv[["全体平均%", "前半平均%", "後半平均%"]], x_label="保有日数（購入後の営業日）", y_label="平均%")
+
+pk_a, pk_b = peak(cv["前半勝率%"]), peak(cv["後半勝率%"])
+pk_all = peak(cv["全体勝率%"])
+c1, c2, c3 = st.columns(3)
+c1.metric("勝率が高い保有日数（全体）", f"{pk_all}日" if pk_all else "-")
+c2.metric("前半", f"{pk_a}日" if pk_a else "-")
+c3.metric("後半", f"{pk_b}日" if pk_b else "-")
+edge = T["max_hold"] - 2  # 上限近くが一番高い＝「長く持つほど良い」で、山になっていない
+if pk_a and pk_b and pk_a >= edge and pk_b >= edge:
+    st.warning(f"前半・後半とも、調べた上限（{T['max_hold']}日）の近くが一番高く、山になっていません。"
+               "「長く持つほど勝率が上がる」だけで、最適な日数は見えていません。"
+               "上昇相場の影響が大きい可能性があるので、「日経平均に勝ったら勝ち」でも確かめてください。")
+elif pk_a and pk_b:
+    gap = abs(pk_a - pk_b)
+    if gap <= max(3, int(0.2 * max(pk_a, pk_b))):
+        st.success(f"前半と後半で、勝率が高い保有日数が近いです（{pk_a}日と{pk_b}日）。目安として使える可能性があります。")
+    else:
+        st.warning(f"前半（{pk_a}日）と後半（{pk_b}日）で、勝率が高い保有日数が離れています。"
+                   "山の位置は偶然の可能性が高いので、特定の日数にこだわらないほうが安全です。")
+st.caption("「勝率が高い保有日数」は、前後5日でならしたうえで一番高い位置です（細かいギザギザに引っ張られないように）。")
+
+pick = [h for h in [1, 3, 5, 10, 15, 20, 30, 40, 60, 90, 120] if h <= T["max_hold"]]
+tbl = []
+for h in pick:
+    v = pd.Series(R[:, 0, h - 1], index=dates)
+    vv = v.dropna()
+    tbl.append({"保有日数": f"{h}日", "件数": len(vv), "勝率%": round(float((vv >= thr).mean() * 100), 1),
+                "平均%": round(float(vv.mean() * 100), 2), "±(95%)": round(1.96 * clustered_se(vv, vv.index) * 100, 2),
+                "前半勝率%": round(cv.loc[h, "前半勝率%"], 1), "後半勝率%": round(cv.loc[h, "後半勝率%"], 1)})
+st.dataframe(pd.DataFrame(tbl), hide_index=True, width="stretch")
+st.caption("±(95%)は平均%の誤差の目安（同じ月の取引どうしの連動を考慮）。保有日数が長いほど、勝率は相場全体の動きに左右されやすくなります。")
+
+# ---- 2. 何日待って買うか
+st.subheader("2. シグナルから何日待って買うか")
+h_sel = st.selectbox("保有日数", list(range(1, T["max_hold"] + 1)), index=min(14, T["max_hold"] - 1),
+                     format_func=lambda h: f"買ってから{h}営業日後に売る")
+rows = []
+for d in range(T["max_delay"] + 1):
+    v = R[:, d, h_sel - 1]
+    ok = ~np.isnan(v)
+    first = dn <= np.datetime64(mid)
+    va, vb = v[ok & first], v[ok & ~first]
+    rows.append({"待つ日数": d, "買う日": "シグナルの翌営業日" if d == 0 else f"翌営業日から{d}日後",
+                 "件数": int(ok.sum()), "勝率%": round(float((v[ok] >= thr).mean() * 100), 1),
+                 "平均%": round(float(v[ok].mean() * 100), 2),
+                 "前半勝率%": round(float((va >= thr).mean() * 100), 1) if len(va) else None,
+                 "後半勝率%": round(float((vb >= thr).mean() * 100), 1) if len(vb) else None})
+dl = pd.DataFrame(rows)
+st.line_chart(dl.set_index("待つ日数")[["勝率%", "前半勝率%", "後半勝率%"]], x_label="待つ日数", y_label="勝率%")
+st.dataframe(dl, hide_index=True, width="stretch")
+best = dl.loc[dl["勝率%"].idxmax()]
+st.caption(f"この保有日数では、{int(best['待つ日数'])}日待ったときの勝率が一番高く {best['勝率%']}% でした"
+           "（すぐ買う＝待つ日数0との差が小さければ、待つ意味はあまりありません）。"
+           "前半・後半の両方で同じ傾向かも確認してください。")
+
+# ---- 3. 待つ日数 × 保有日数 の一覧
+st.subheader("3. 待つ日数 × 保有日数 の勝率一覧")
+cols = [h for h in pick]
+grid = pd.DataFrame({f"{h}日保有": [round(float((R[:, d, h - 1][~np.isnan(R[:, d, h - 1])] >= thr).mean() * 100), 1)
+                                   for d in range(T["max_delay"] + 1)] for h in cols},
+                    index=pd.Index(range(T["max_delay"] + 1), name="待つ日数"))
+st.dataframe(grid, width="stretch")
+
+st.info(
+    "読み方の注意\n\n"
+    "- グラフの一番高い所だけを選ぶと、偶然の山を拾いやすくなります。前半と後半で同じあたりが高いかを重視してください。\n"
+    "- 同じ銘柄で短い間にシグナルが続くと、似た取引が重なって数えられます。\n"
+    "- 今も上場している銘柄・今の構成銘柄で調べているため、実際より成績が良く出やすいです。"
+)
+st.caption("過去の結果は将来を保証しません。投資判断の材料の一つです。")
