@@ -3,8 +3,10 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from gc_core import (make_template, render_template_saver, render_universe, resolve_items, COND_LABEL, CONDS, SAMPLE, TRIGGERS, compute, fetch_all, fetch_market, masks, parse_tickers,
-                     render_conditions, signal)
+from gc_core import (COND_LABEL, CONDS, TRIGGERS, WIN_BASES, clustered_se, compute, fetch_all, fetch_market,
+                     fetch_market_ohlc, fwd_returns, is_seq, make_template, masks, render_conditions,
+                     render_template_saver, render_universe, render_win_basis, resolve_items, signal,
+                     trigger_label, trigger_series)
 
 st.set_page_config(page_title="過去検証", page_icon="🔬", layout="centered")
 WIN_THR = 0.0  # 勝ちの基準（リターン、小数。下の入力欄で上書き）
@@ -26,17 +28,19 @@ kind, text = render_universe()
 
 p = render_conditions(show_days=False)
 with st.expander("④ 勝ちの条件・期間", expanded=True):
+    basis = render_win_basis("bt_win_basis")
     c1, c2 = st.columns(2)
     n_hold = int(c1.number_input("保有日数（購入後◯営業日）", 1, 250, 15, 1,
                                  help="購入日から数えて何営業日後に売るか。推奨: 15日（約3週間）。20営業日≒1か月。"))
-    win_pct = c2.number_input("勝ちの基準（リターン◯%以上）", -20.0, 50.0, 0.0, 0.5,
+    win_pct = c2.number_input("勝ちの基準（◯%以上）", -20.0, 50.0, 0.0, 0.5,
                               help="売買コストを引いたあとのリターンがこの値以上なら「勝ち」。推奨: 0%（プラスなら勝ち）。"
                                    "「+3%以上で勝ち」にしたいときは3を入れます。")
     c3, c4 = st.columns(2)
     n_days = int(c3.number_input("検証期間（営業日）", 250, 1500, 1000, 50, help="推奨: 1000日（約4年）。"))
     cost = c4.number_input("売買コスト（往復%）", 0.0, 3.0, 0.2, 0.1,
                            help="推奨: 0.2%前後（手数料＋値段のズレ）。") / 100
-    st.caption(f"今の設定：購入後 **{n_hold}営業日** 時点で、リターンが **{win_pct:g}%以上** なら勝ち")
+    st.caption(f"今の設定：購入後 **{n_hold}営業日** 時点で、"
+               + ("リターン" if basis == "abs" else "日経平均との差") + f"が **{win_pct:g}%以上** なら勝ち")
 WIN_THR = win_pct / 100
 
 if st.button("▶ 検証を実行", type="primary", width="stretch"):
@@ -56,6 +60,10 @@ if st.button("▶ 検証を実行", type="primary", width="stretch"):
     if mkt is None:
         st.warning("日経平均を取得できなかったため、地合いの条件は使わずに検証します。")
         p["market_on"] = False
+    mkt_px = fetch_market_ohlc(period) if basis == "rel" else None
+    if basis == "rel" and mkt_px is None:
+        st.warning("日経平均を取得できなかったため、「リターンがプラスなら勝ち」で検証します。")
+        basis = "abs"
 
     frames = []
     for code, df in data.items():
@@ -64,20 +72,20 @@ if st.button("▶ 検証を実行", type="primary", width="stretch"):
         x = compute(df, p["short"], p["long"], mkt, p["pb_pct"], p["rv_rsi"])
         m = masks(x, p)
         t = pd.DataFrame(m)
-        t["cross"] = x["trig_" + p["trigger"]]  # 選んだきっかけ（以下「基準のきっかけ」）
+        t["cross"] = trigger_series(x, p["trigger"])  # 選んだきっかけ（以下「基準のきっかけ」）
         for k in TRIGGERS:
             t["trig_" + k] = x["trig_" + k]
         t["sig"] = signal(x, p, m)
-        entry = df["Open"].shift(-1)  # 購入日（シグナルの翌営業日）の始値
-        for h in horizons:
-            t[f"r{h}"] = df["Close"].shift(-(h + 1)) / entry - 1 - cost  # 購入日からh営業日後の終値で売る
+        # 買い＝シグナル翌営業日の始値、売り＝購入日からh営業日後の終値（「日経平均に勝ったら」は日経平均との差）
+        for h, r in fwd_returns(df, horizons, cost, 0, mkt_px if basis == "rel" else None).items():
+            t[f"r{h}"] = r
         t["code"] = code
         frames.append(t.iloc[-n_days:])
     if not frames:
         st.error("検証できる株価データがありませんでした。")
         st.stop()
     st.session_state["bt"] = dict(T=pd.concat(frames), p=dict(p), mkt_ok=mkt is not None, n_codes=len(frames),
-                                  horizons=horizons, n_hold=n_hold, universe=kind)
+                                  horizons=horizons, n_hold=n_hold, universe=kind, basis=basis)
 
 if "bt" not in st.session_state:
     st.stop()
@@ -89,10 +97,14 @@ mid = T.index.min() + (T.index.max() - T.index.min()) / 2
 st.divider()
 st.write(f"対象 {bt['n_codes']} 銘柄 / 期間 {T.index.min():%Y-%m-%d} 〜 {T.index.max():%Y-%m-%d} / "
          f"今の設定のシグナル **{len(S)} 件**（{S.index.nunique()} 日）")
+BASIS = bt.get("basis", "abs")
+if BASIS == "rel":
+    st.info("勝ち負けと平均%は「日経平均との差」です（同じ期間の日経平均のリターンを差し引いた値）。"
+            "プラスなら日経平均より上がった、という意味です。")
 
 # ---- 0. きっかけ別の比較
 st.subheader("0. 買いのきっかけ別の比較")
-st.caption(f"同じ保有日数（購入後{bt['n_hold']}日）・同じ勝ちの基準で、4つのきっかけを比べています。"
+st.caption(f"同じ保有日数（購入後{bt['n_hold']}日）・同じ勝ちの基準で、きっかけを比べています。"
            "「絞り込みなし」はきっかけだけ、「絞り込みあり」は③でONにした条件をすべて足した場合です。")
 cond_all = np.ones(len(T), dtype=bool)
 for c in CONDS:
@@ -101,14 +113,16 @@ for c in CONDS:
 rc0 = f"r{bt['n_hold']}"
 _, bw0, bmu0 = stat(T[rc0])
 trig_rows = []
-for k, v in TRIGGERS.items():
-    g0 = T[T["trig_" + k].to_numpy(bool)]
-    g1 = T[T["trig_" + k].to_numpy(bool) & cond_all]
+_keys = list(TRIGGERS) + ([pp["trigger"]] if is_seq(pp["trigger"]) else [])
+for k in _keys:
+    _col = "cross" if k == pp["trigger"] else "trig_" + k
+    g0 = T[T[_col].to_numpy(bool)]
+    g1 = T[T[_col].to_numpy(bool) & cond_all]
     n0, w0, m0 = stat(g0[rc0])
     n1, w1, m1 = stat(g1[rc0])
     _, wa, _ = stat(g0[g0.index <= mid][rc0])
     _, wb, _ = stat(g0[g0.index > mid][rc0])
-    trig_rows.append({"きっかけ": v["label"] + ("◀選択中" if k == pp["trigger"] else ""),
+    trig_rows.append({"きっかけ": trigger_label(k) + ("◀選択中" if k == pp["trigger"] else ""),
                       "件数": n0, "勝率%": round(w0, 1), "平均%": round(m0, 2),
                       "前半勝率%": round(wa, 1), "後半勝率%": round(wb, 1),
                       "絞り込みあり 件数": n1, "絞り込みあり 勝率%": round(w1, 1), "絞り込みあり 平均%": round(m1, 2)})
@@ -126,7 +140,7 @@ for h in HZ:
     n, w, mu = stat(S[f"r{h}"])
     _, bw, bmu = stat(T[f"r{h}"])
     _, cw, cmu = stat(T[T["cross"]][f"r{h}"])
-    se = S[f"r{h}"].dropna().std() / np.sqrt(n) * 100 if n > 1 else float("nan")
+    se = clustered_se(S[f"r{h}"], S.index) * 100  # 同じ月の取引どうしの連動を考慮した誤差
     rows.append({"保有（購入後）": f"{h}日" + ("◀設定" if h == NH else ""), "件数": n, "勝率%": round(w, 1),
                  "平均%": round(mu, 2), "±(95%)": round(1.96 * se, 2),
                  "きっかけのみ勝率%": round(cw, 1), "きっかけのみ平均%": round(cmu, 2),
@@ -138,10 +152,11 @@ st.caption("勝率は、リターン（売買コスト引き後）が勝ちの�
 
 with st.expander("💾 この条件をテンプレとして保存", expanded=False):
     _n, _w, _mu = stat(S[f"r{NH}"])
-    _label = TRIGGERS[pp["trigger"]]["label"]
+    _label = trigger_label(pp["trigger"])
     _name = st.text_input("テンプレの名前", value=f"{_label} 勝率{_w:.0f}%（{pd.Timestamp.now():%m/%d}検証）",
                           key="_tpl_name_bt")
-    _memo = (f"{_label}／購入後{NH}日・リターン{WIN_THR * 100:g}%以上で勝ち／"
+    _memo = (f"{_label}／購入後{NH}日・" + ("リターン" if BASIS == "abs" else "日経平均との差")
+             + f"{WIN_THR * 100:g}%以上で勝ち／"
              f"過去検証：件数{_n}・勝率{_w:.1f}%・平均{_mu:.2f}%（{pd.Timestamp.now():%Y-%m-%d}）")
     render_template_saver(make_template(_name, {**pp, "universe": bt.get("universe", "topix500")}, _memo))
 
@@ -159,9 +174,8 @@ _, _, b2 = stat(base[base.index > mid][rc])
 
 
 def noise(r):
-    """平均リターンの誤差の目安（95%・%ポイント）。"""
-    r = r.dropna()
-    return 1.96 * r.std() / np.sqrt(len(r)) * 100 if len(r) > 1 else float("nan")
+    """平均リターンの誤差の目安（95%・%ポイント）。同じ月の取引どうしの連動を考慮。"""
+    return 1.96 * clustered_se(r, r.index) * 100
 
 
 def judge(n, d, d1, d2, err):
@@ -229,6 +243,8 @@ st.info(
     "- 件数が30件未満の結果は、偶然の可能性が高いです。\n"
     "- 条件をたくさん試すと、偶然よく見えるものが混ざります。「前半・後半の両方で改善」を重視してください。\n"
     "- 同じ日に多数の銘柄でシグナルが出ると、相場全体の動きに結果が左右されます。\n"
-    "- 今も上場している銘柄だけで調べているため、実際より成績が良く出やすいです（生存者バイアス）。"
+    "- 今も上場している銘柄だけで調べているため、実際より成績が良く出やすいです（生存者バイアス）。\n"
+    "- TOPIX500や小型株500は「今の」構成銘柄です。過去に成長して入った銘柄も含むため、成績がよく出やすい点に注意してください。\n"
+    "- 「±」の誤差は、同じ月の取引どうしが連動しやすいことを考慮して計算しています。"
 )
 st.caption("過去の結果は将来を保証しません。投資判断の材料の一つです。")
